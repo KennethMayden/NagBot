@@ -1,0 +1,11 @@
+{
+  "lock": false,
+  "tasks": {
+    "dev": "deno run -q --config=deno.jsonc --watch --unstable-kv https://deno.land/x/deno_slack_runtime@2.0.0/local-run.ts",
+    "test": "deno test --allow-read --allow-env --watch ./..."
+  },
+  "imports": {
+    "deno-slack-sdk/": "https://deno.land/x/deno_slack_sdk@2.14.2/",
+    "deno-slack-api/": "https://deno.land/x/deno_slack_api@2.8.0/"
+  }
+}
