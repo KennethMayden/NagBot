@@ -52,8 +52,17 @@ function deadlineBlocks(): unknown[] {
   ];
 }
 
-// Builds the full modal block list; conditionally includes deadline blocks
-function buildModalBlocks(nagType: string): unknown[] {
+const EVERYONE_OPTION = {
+  text: { type: "plain_text", text: "Pre-fill everyone in this channel", emoji: true },
+  value: "nag_everyone",
+};
+
+// Builds the full modal block list; conditionally includes deadline blocks and pre-filled users
+function buildModalBlocks(
+  nagType: string,
+  initialUsers?: string[],
+  everyoneChecked = false,
+): unknown[] {
   const selectedOption =
     NAG_TYPE_OPTIONS.find((o) => o.value === nagType) ?? NAG_TYPE_OPTIONS[0];
 
@@ -62,38 +71,37 @@ function buildModalBlocks(nagType: string): unknown[] {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*Who do you want to nag?*\nCheck the box to nag everyone, or pick specific people below.",
+        text: "*Who do you want to nag?*\nPre-fill everyone and remove who you like, or pick specific people.",
       },
     },
     {
-      type: "input",
+      // actions block (not input) so the checkbox fires block_actions immediately on click
+      type: "actions",
       block_id: "nag_everyone_block",
-      optional: true,
-      label: { type: "plain_text", text: "Nag everyone" },
-      element: {
-        type: "checkboxes",
-        action_id: "nag_everyone_select",
-        options: [
-          {
-            text: {
-              type: "plain_text",
-              text: "Nag everyone in this channel",
-              emoji: true,
-            },
-            value: "nag_everyone",
-          },
-        ],
-      },
+      elements: [
+        {
+          type: "checkboxes",
+          action_id: "nag_everyone_select",
+          options: [EVERYONE_OPTION],
+          ...(everyoneChecked ? { initial_options: [EVERYONE_OPTION] } : {}),
+        },
+      ],
     },
     {
       type: "input",
       block_id: "users_block",
       optional: true,
-      label: { type: "plain_text", text: "Or pick specific people" },
+      label: {
+        type: "plain_text",
+        text: everyoneChecked
+          ? "Remove anyone you don't want to nag"
+          : "Or pick specific people",
+      },
       element: {
         type: "multi_users_select",
         action_id: "users_select",
         placeholder: { type: "plain_text", text: "Select people…" },
+        ...(initialUsers?.length ? { initial_users: initialUsers } : {}),
       },
     },
     {
@@ -187,12 +195,40 @@ export default SlackFunction(
     return { completed: false };
   },
 ).addBlockActionsHandler(
-  "nag_type_select",
+  "nag_everyone_select",
   async ({ action, body, client }) => {
-    const selectedType =
-      (action as { selected_option: { value: string } }).selected_option
-        .value;
-    const view = body.view as { id: string; private_metadata: string };
+    const checked = (
+      action as { selected_options: { value: string }[] }
+    ).selected_options.some((o) => o.value === "nag_everyone");
+
+    const view = body.view as {
+      id: string;
+      private_metadata: string;
+      state: { values: Record<string, Record<string, { selected_option?: { value: string }; selected_users?: string[] }>> };
+    };
+    const meta = JSON.parse(view.private_metadata);
+    const nagType =
+      view.state.values.nag_type_block?.nag_type_select?.selected_option
+        ?.value ?? "standard";
+
+    let initialUsers: string[] | undefined;
+    if (checked) {
+      let allMembers: string[] = [];
+      let cursor: string | undefined = undefined;
+      do {
+        const membersResponse = await client.conversations.members({
+          channel: meta.channel,
+          limit: 200,
+          ...(cursor ? { cursor } : {}),
+        });
+        if (membersResponse.error) break;
+        allMembers = allMembers.concat(
+          (membersResponse.members as string[]) ?? [],
+        );
+        cursor = membersResponse.response_metadata?.next_cursor || undefined;
+      } while (cursor);
+      initialUsers = allMembers.filter((uid) => uid !== meta.nagged_by);
+    }
 
     await client.views.update({
       view_id: view.id,
@@ -203,7 +239,39 @@ export default SlackFunction(
         submit: { type: "plain_text", text: "Send Nag", emoji: true },
         close: { type: "plain_text", text: "Cancel" },
         private_metadata: view.private_metadata,
-        blocks: buildModalBlocks(selectedType),
+        blocks: buildModalBlocks(nagType, initialUsers, checked),
+      },
+    });
+  },
+).addBlockActionsHandler(
+  "nag_type_select",
+  async ({ action, body, client }) => {
+    const selectedType =
+      (action as { selected_option: { value: string } }).selected_option
+        .value;
+    const view = body.view as {
+      id: string;
+      private_metadata: string;
+      state: { values: Record<string, Record<string, { selected_users?: string[] }>> };
+    };
+
+    // Preserve any users already in the multi-select
+    const currentUsers: string[] =
+      view.state.values.users_block?.users_select?.selected_users ?? [];
+
+    await client.views.update({
+      view_id: view.id,
+      view: {
+        type: "modal",
+        callback_id: "nag_modal",
+        title: { type: "plain_text", text: "🔔 Send a Nag", emoji: true },
+        submit: { type: "plain_text", text: "Send Nag", emoji: true },
+        close: { type: "plain_text", text: "Cancel" },
+        private_metadata: view.private_metadata,
+        blocks: buildModalBlocks(
+          selectedType,
+          currentUsers.length ? currentUsers : undefined,
+        ),
       },
     });
   },
@@ -212,12 +280,7 @@ export default SlackFunction(
   const meta = JSON.parse(view.private_metadata);
   const { channel, nagged_by } = meta;
 
-  const nagEveryone: boolean =
-    values.nag_everyone_block?.nag_everyone_select?.selected_options?.some(
-      (o: { value: string }) => o.value === "nag_everyone",
-    ) ?? false;
-
-  let selectedUsers: string[] =
+  const selectedUsers: string[] =
     values.users_block?.users_select?.selected_users ?? [];
 
   const message: string = values.message_block.message_input.value ?? "";
@@ -256,33 +319,12 @@ export default SlackFunction(
     }
   }
 
-  if (nagEveryone) {
-    // Fetch all channel members with pagination
-    let allMembers: string[] = [];
-    let cursor: string | undefined = undefined;
-    do {
-      const membersResponse = await client.conversations.members({
-        channel,
-        limit: 200,
-        ...(cursor ? { cursor } : {}),
-      });
-      if (membersResponse.error) break;
-      allMembers = allMembers.concat(
-        (membersResponse.members as string[]) ?? [],
-      );
-      cursor = membersResponse.response_metadata?.next_cursor || undefined;
-    } while (cursor);
-
-    // Exclude the sender
-    selectedUsers = allMembers.filter((uid: string) => uid !== nagged_by);
-  }
-
   if (!selectedUsers.length || !message) {
     return {
       response_action: "errors",
       errors: {
         users_block:
-          "Please select at least one person, or check 'Nag everyone'.",
+          "Please select at least one person, or use 'Pre-fill everyone'.",
       },
     };
   }
