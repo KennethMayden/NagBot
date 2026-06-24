@@ -46,8 +46,7 @@ export default SlackFunction(
             type: "section",
             text: {
               type: "mrkdwn",
-              text:
-                "*Who do you want to nag?*\nCheck the box to nag everyone, or pick specific people below.",
+              text: "*Who do you want to nag?*\nCheck the box to nag everyone, or pick specific people below.",
             },
           },
           {
@@ -94,8 +93,7 @@ export default SlackFunction(
               multiline: true,
               placeholder: {
                 type: "plain_text",
-                text:
-                  "e.g. Please react ✅ once you have reviewed the Q3 report.",
+                text: "e.g. Please react ✅ once you have reviewed the Q3 report.",
               },
             },
           },
@@ -104,8 +102,7 @@ export default SlackFunction(
             elements: [
               {
                 type: "mrkdwn",
-                text:
-                  "💡 _Use `/nag-check` after posting to follow up on non-reactors._",
+                text: "💡 _Use `/nag-check` after posting to follow up on non-reactors._",
               },
             ],
           },
@@ -119,124 +116,122 @@ export default SlackFunction(
 
     return { completed: false };
   },
-)
-  .addViewSubmissionHandler("nag_modal", async ({ view, client }) => {
-    const values = view.state.values;
-    const meta = JSON.parse(view.private_metadata);
-    const { channel, nagged_by } = meta;
+).addViewSubmissionHandler("nag_modal", async ({ view, client }) => {
+  const values = view.state.values;
+  const meta = JSON.parse(view.private_metadata);
+  const { channel, nagged_by } = meta;
 
-    const nagEveryone: boolean =
-      values.nag_everyone_block?.nag_everyone_select?.selected_options?.some(
-        (o: { value: string }) => o.value === "nag_everyone",
-      ) ?? false;
+  const nagEveryone: boolean =
+    values.nag_everyone_block?.nag_everyone_select?.selected_options?.some(
+      (o: { value: string }) => o.value === "nag_everyone",
+    ) ?? false;
 
-    let selectedUsers: string[] =
-      values.users_block?.users_select?.selected_users ?? [];
+  let selectedUsers: string[] =
+    values.users_block?.users_select?.selected_users ?? [];
 
-    const message: string = values.message_block.message_input.value ?? "";
+  const message: string = values.message_block.message_input.value ?? "";
 
-    if (nagEveryone) {
-      // Fetch all channel members with pagination
-      let allMembers: string[] = [];
-      let cursor: string | undefined = undefined;
-      do {
-        const membersResponse = await client.conversations.members({
-          channel,
-          limit: 200,
-          ...(cursor ? { cursor } : {}),
-        });
-        if (membersResponse.error) break;
-        allMembers = allMembers.concat(
-          (membersResponse.members as string[]) ?? [],
-        );
-        cursor = membersResponse.response_metadata?.next_cursor || undefined;
-      } while (cursor);
+  if (nagEveryone) {
+    // Fetch all channel members with pagination
+    let allMembers: string[] = [];
+    let cursor: string | undefined = undefined;
+    do {
+      const membersResponse = await client.conversations.members({
+        channel,
+        limit: 200,
+        ...(cursor ? { cursor } : {}),
+      });
+      if (membersResponse.error) break;
+      allMembers = allMembers.concat(
+        (membersResponse.members as string[]) ?? [],
+      );
+      cursor = membersResponse.response_metadata?.next_cursor || undefined;
+    } while (cursor);
 
-      // Exclude the sender
-      selectedUsers = allMembers.filter((uid: string) => uid !== nagged_by);
-    }
+    // Exclude the sender
+    selectedUsers = allMembers.filter((uid: string) => uid !== nagged_by);
+  }
 
-    if (!selectedUsers.length || !message) {
-      return {
-        response_action: "errors",
-        errors: {
-          users_block:
-            "Please select at least one person, or check 'Nag everyone'.",
-        },
-      };
-    }
+  if (!selectedUsers.length || !message) {
+    return {
+      response_action: "errors",
+      errors: {
+        users_block:
+          "Please select at least one person, or check 'Nag everyone'.",
+      },
+    };
+  }
 
-    // Build the nag message
-    const mentions = selectedUsers.map((uid: string) => `<@${uid}>`).join(" ");
-    const fullMessage = `${mentions}\n\n${message}\n\n_Please react to this message (e.g. ✅) once you're done!_`;
+  // Build the nag message
+  const mentions = selectedUsers.map((uid: string) => `<@${uid}>`).join(" ");
+  const fullMessage = `${mentions}\n\n${message}\n\n_Please react to this message (e.g. ✅) once you're done!_`;
 
-    // Post the nag
-    const postResponse = await client.chat.postMessage({
-      channel,
-      text: fullMessage,
-      blocks: [
-        {
-          type: "section",
-          text: { type: "mrkdwn", text: fullMessage },
-        },
-        {
-          type: "context",
-          elements: [
-            {
-              type: "mrkdwn",
-              text: `_Nag sent by <@${nagged_by}> • Use \`/nag-check\` to follow up_`,
-            },
-          ],
-        },
-      ],
+  // Post the nag
+  const postResponse = await client.chat.postMessage({
+    channel,
+    text: fullMessage,
+    blocks: [
+      {
+        type: "section",
+        text: { type: "mrkdwn", text: fullMessage },
+      },
+      {
+        type: "context",
+        elements: [
+          {
+            type: "mrkdwn",
+            text: `_Nag sent by <@${nagged_by}> • Use \`/nag-check\` to follow up_`,
+          },
+        ],
+      },
+    ],
+  });
+
+  if (postResponse.error) {
+    return { response_action: "clear" };
+  }
+
+  const nagId = crypto.randomUUID();
+  const now = Math.floor(Date.now() / 1000);
+
+  // Save nag to datastore
+  await client.apps.datastore.put({
+    datastore: "nags",
+    item: {
+      id: nagId,
+      channel_id: channel,
+      message_ts: postResponse.ts as string,
+      nagged_by,
+      nagged_users: JSON.stringify(selectedUsers),
+      message,
+      created_at: now,
+    },
+  });
+
+  // Increment nag counts for each nagged user
+  for (const uid of selectedUsers) {
+    const existing = await client.apps.datastore.get({
+      datastore: "nag_counts",
+      id: uid,
     });
 
-    if (postResponse.error) {
-      return { response_action: "clear" };
-    }
+    const currentCount: number = (existing.item?.total_nags as number) ?? 0;
 
-    const nagId = crypto.randomUUID();
-    const now = Math.floor(Date.now() / 1000);
-
-    // Save nag to datastore
     await client.apps.datastore.put({
-      datastore: "nags",
+      datastore: "nag_counts",
       item: {
-        id: nagId,
-        channel_id: channel,
-        message_ts: postResponse.ts as string,
-        nagged_by,
-        nagged_users: JSON.stringify(selectedUsers),
-        message,
-        created_at: now,
+        user_id: uid,
+        total_nags: currentCount + 1,
+        last_nagged: now,
       },
     });
+  }
 
-    // Increment nag counts for each nagged user
-    for (const uid of selectedUsers) {
-      const existing = await client.apps.datastore.get({
-        datastore: "nag_counts",
-        id: uid,
-      });
-
-      const currentCount: number =
-        (existing.item?.total_nags as number) ?? 0;
-
-      await client.apps.datastore.put({
-        datastore: "nag_counts",
-        item: {
-          user_id: uid,
-          total_nags: currentCount + 1,
-          last_nagged: now,
-        },
-      });
-    }
-
-    // Complete the function
-    await client.functions.completeSuccess({
-      function_execution_id: view.private_metadata,
-      outputs: {},
-    });
-
-    return { response_action: "clear" };
+  // Complete the function
+  await client.functions.completeSuccess({
+    function_execution_id: view.private_metadata,
+    outputs: {},
   });
+
+  return { response_action: "clear" };
+});
