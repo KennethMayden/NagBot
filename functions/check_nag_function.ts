@@ -83,21 +83,29 @@ export default SlackFunction(
       // (no-op if already a member; fails silently for private channels)
       await client.conversations.join({ channel }).catch(() => {});
 
+      // Check reactions on the original message + any reminder messages
+      const reminderTs: string[] = JSON.parse(
+        (nag.reminder_timestamps as string) || "[]",
+      );
+      const timestampsToCheck = [msgTs, ...reminderTs];
+
       let reactedUsers: string[] = [];
-      try {
-        const reactRes = await client.reactions.get({
-          channel,
-          timestamp: msgTs,
-          full: true,
-        });
-        const reactions =
-          (reactRes.message as Record<string, unknown>)?.reactions ?? [];
-        const allUsers = (reactions as Record<string, unknown>[]).flatMap(
-          (r) => r.users as string[],
-        );
-        reactedUsers = [...new Set(allUsers)];
-      } catch (_) {
-        // Message may have been deleted
+      for (const ts of timestampsToCheck) {
+        try {
+          const reactRes = await client.reactions.get({
+            channel,
+            timestamp: ts,
+            full: true,
+          });
+          const reactions =
+            (reactRes.message as Record<string, unknown>)?.reactions ?? [];
+          const users = (reactions as Record<string, unknown>[]).flatMap(
+            (r) => r.users as string[],
+          );
+          reactedUsers = [...new Set([...reactedUsers, ...users])];
+        } catch (_) {
+          // Message may have been deleted
+        }
       }
 
       const done = naggedUsers.filter((uid) => reactedUsers.includes(uid));
@@ -232,7 +240,7 @@ export default SlackFunction(
   },
 ).addBlockActionsHandler(/^renag_/, async ({ action, body, client }) => {
   const payload = JSON.parse((action as Record<string, string>).value);
-  const { channel, pendingUsers, originalMessage, messageTs } = payload;
+  const { nagId, channel, pendingUsers, originalMessage, messageTs } = payload;
   const channelId = channel as string;
   const checker = body.user.id;
 
@@ -250,12 +258,33 @@ export default SlackFunction(
     .map((uid) => `<@${uid}>`)
     .join(" ");
 
-  await client.chat.postMessage({
+  const reminderPost = await client.chat.postMessage({
     channel: channelId,
     text: `🔔 *Reminder!* ${mentions}\n\nYou haven't reacted to ${
       permalink ? `<${permalink}|this message>` : "the original nag"
     } yet.\n_Original ask: "${originalMessage}"_`,
   });
+
+  // Store the reminder message timestamp so reactions to it also count
+  if (reminderPost.ok && reminderPost.ts && nagId) {
+    const existing = await client.apps.datastore.get({
+      datastore: "nags",
+      id: nagId as string,
+    });
+    if (existing.ok && existing.item) {
+      const reminders: string[] = JSON.parse(
+        (existing.item.reminder_timestamps as string) || "[]",
+      );
+      reminders.push(reminderPost.ts as string);
+      await client.apps.datastore.put({
+        datastore: "nags",
+        item: {
+          ...existing.item,
+          reminder_timestamps: JSON.stringify(reminders),
+        },
+      });
+    }
+  }
 
   // Increment nag counts for re-nagged users
   const now = Math.floor(Date.now() / 1000);
