@@ -12,6 +12,7 @@ A Slack app that runs entirely on **Slack's own infrastructure** (ROSI) — no s
 | 🔍 **Check Nag Reactions** shortcut | Shows reaction progress on recent nags with a one-click **Re-nag** button and option to cancel recurring nags |
 | 📊 **Nag Stats** shortcut | Private stats showing most/least nagged people plus the reaction speed points leaderboard |
 | 🏆 **Reaction Speed Leaderboard** (automatic) | Pinned public message in the nag-bot channel — posted on first reaction, updated in-place on every subsequent one |
+| 🗑️ **Clear Leaderboard** shortcut | Opens a confirmation modal — clears all reaction speed points and refreshes the pinned leaderboard to an empty state |
 | 🔁 **Daily Recurring Nag** (scheduled) | Automatically re-nags pending users at 08:00 UTC every day for active recurring nags |
 | 🏁 **Nag Completion Check** (scheduled) | Runs hourly — detects when everyone has reacted, deletes the nag record, and sends the nagger a DM |
 
@@ -104,12 +105,13 @@ After running `slack run` or `slack deploy`, create each trigger:
 slack triggers create --trigger-def triggers/nag.ts
 slack triggers create --trigger-def triggers/nag_check.ts
 slack triggers create --trigger-def triggers/nag_stats.ts
+slack triggers create --trigger-def triggers/clear_leaderboard.ts
 slack triggers create --trigger-def triggers/reaction_added.ts
 slack triggers create --trigger-def triggers/recurring_nag.ts
 slack triggers create --trigger-def triggers/nag_completion_check.ts
 ```
 
-The first three output a **link trigger URL** (looks like `https://slack.com/shortcuts/...`). Share these in your workspace:
+The first four output a **link trigger URL** (looks like `https://slack.com/shortcuts/...`). Share these in your workspace:
 
 - Post them in a channel
 - Add them to your Slack sidebar as bookmarks
@@ -146,20 +148,21 @@ nag-bot-deno/
 │   ├── nag_stats_function.ts            # Stats of most/least nagged + points leaderboard
 │   ├── reaction_points_function.ts      # Awards points when a nag reaction is added
 │   ├── leaderboard_message.ts           # Utility: posts/updates the pinned leaderboard message
+│   ├── clear_leaderboard_function.ts    # Confirmation modal + deletes all reaction_points records
 │   ├── recurring_nag_function.ts        # Daily: re-nags pending users on active recurring nags
 │   └── nag_completion_check_function.ts # Hourly: detects completed nags, cleans up, DMs nagger
 ├── workflows/
 │   ├── send_nag.ts                # Wires trigger → send nag function
 │   ├── check_nag.ts               # Wires trigger → check nag function
 │   ├── nag_stats.ts               # Wires trigger → stats function
+│   ├── clear_leaderboard.ts       # Wires trigger → clear leaderboard function
 │   ├── reaction_added.ts          # Wires reaction_added event → points function
 │   ├── recurring_nag.ts           # Wires scheduled trigger → recurring nag function
 │   └── nag_completion_check.ts    # Wires scheduled trigger → completion check function
 └── triggers/
     ├── nag.ts                     # Link trigger for sending nags
     ├── nag_check.ts               # Link trigger for checking reactions
-    ├── nag_stats.ts               # Link trigger for stats + leaderboard
-    ├── reaction_added.ts          # Event trigger — fires on reaction_added in nag-bot channel
+    ├── nag_stats.ts               # Link trigger for stats + leaderboard│   ├── clear_leaderboard.ts       # Link trigger for clearing the leaderboard    ├── reaction_added.ts          # Event trigger — fires on reaction_added in nag-bot channel
     ├── recurring_nag.ts           # Scheduled trigger — daily at 08:00 UTC
     └── nag_completion_check.ts    # Scheduled trigger — hourly completion check
 ```
@@ -206,6 +209,13 @@ This means you don't need to manually run Check Nag Reactions to get notified �
 Click **Nag Stats**. You'll see (privately) who has been nagged the most and least, plus the full **reaction speed points leaderboard** at the bottom.
 
 The **pinned 🏆 leaderboard message** in the nag-bot channel is always visible to everyone — find it via the 📌 Pins icon in the channel header. It is created automatically on the first reaction and updated in-place thereafter.
+
+### Clearing the leaderboard
+
+Click **Clear Leaderboard**. A confirmation modal appears warning that this will permanently reset all reaction speed points to zero. Click **Yes, clear it** to proceed, or **Cancel** to abort. On confirmation:
+- All records in the `reaction_points` datastore are deleted
+- The pinned leaderboard message is refreshed to show an empty state
+- You receive a private confirmation message
 
 ### Automatic daily re-nags
 

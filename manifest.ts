@@ -1,4 +1,5 @@
 import CheckNagWorkflow from "./workflows/check_nag.ts";
+import ClearLeaderboardWorkflow from "./workflows/clear_leaderboard.ts";
 import LeaderboardConfigDatastore from "./datastores/leaderboard_config.ts";
 import { Manifest } from "deno-slack-sdk/mod.ts";
 import NagCountsDatastore from "./datastores/nag_counts.ts";
@@ -22,6 +23,7 @@ export default Manifest({
     RecurringNagWorkflow,
     NagCompletionCheckWorkflow,
     ReactionAddedWorkflow,
+    ClearLeaderboardWorkflow,
   ],
   outgoingDomains: [],
   botScopes: [
