@@ -1,5 +1,12 @@
 import { DefineFunction, Schema, SlackFunction } from "deno-slack-sdk/mod.ts";
 
+// All nag @mentions are always posted here
+const NAG_BOT_CHANNEL_ID = "C0BDN88PS00";
+// Source channel for "Nag everyone" — pulls all members from here
+const Q1_NAG_CHANNEL_ID = "C0BB9SDDYDR";
+// switch to general channel id when we do live demo
+// const GENERAL_CHANNEL_ID = "C02FQJL1Z";
+
 // Options shared between buildModalBlocks and the block_actions handler
 const NAG_TYPE_OPTIONS = [
   {
@@ -53,7 +60,7 @@ function deadlineBlocks(): unknown[] {
 }
 
 const EVERYONE_OPTION = {
-  text: { type: "plain_text", text: "Pre-fill everyone in this channel", emoji: true },
+  text: { type: "plain_text", text: "Pre-fill everyone in the team", emoji: true },
   value: "nag_everyone",
 };
 
@@ -71,7 +78,7 @@ function buildModalBlocks(
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*Who do you want to nag?*\nPre-fill everyone and remove who you like, or pick specific people.",
+        text: "*Who do you want to nag?*\nPre-fill everyone in the team and remove who you like, or pick specific people.",
       },
     },
     {
@@ -217,7 +224,7 @@ export default SlackFunction(
       let cursor: string | undefined = undefined;
       do {
         const membersResponse = await client.conversations.members({
-          channel: meta.channel,
+          channel: Q1_NAG_CHANNEL_ID,
           limit: 200,
           ...(cursor ? { cursor } : {}),
         });
@@ -227,7 +234,7 @@ export default SlackFunction(
         );
         cursor = membersResponse.response_metadata?.next_cursor || undefined;
       } while (cursor);
-      initialUsers = allMembers.filter((uid) => uid !== meta.nagged_by);
+      initialUsers = allMembers;
     }
 
     // Store prefilled users in metadata so submission can read them if the
@@ -341,13 +348,45 @@ export default SlackFunction(
     };
   }
 
+  // Ensure the bot is in the nag-bot channel
+  await client.conversations.join({ channel: NAG_BOT_CHANNEL_ID }).catch(
+    () => {},
+  );
+
+  // Invite any selected users who are not yet members of the nag-bot channel
+  let nagBotMembers: string[] = [];
+  let nbCursor: string | undefined;
+  do {
+    const mRes = await client.conversations.members({
+      channel: NAG_BOT_CHANNEL_ID,
+      limit: 200,
+      ...(nbCursor ? { cursor: nbCursor } : {}),
+    });
+    if (!mRes.error) {
+      nagBotMembers = nagBotMembers.concat(
+        (mRes.members as string[]) ?? [],
+      );
+    }
+    nbCursor = mRes.response_metadata?.next_cursor || undefined;
+  } while (nbCursor);
+
+  const usersToInvite = selectedUsers.filter(
+    (uid: string) => !nagBotMembers.includes(uid),
+  );
+  if (usersToInvite.length > 0) {
+    await client.conversations.invite({
+      channel: NAG_BOT_CHANNEL_ID,
+      users: usersToInvite.join(","),
+    }).catch(() => {});
+  }
+
   // Build the nag message
   const mentions = selectedUsers.map((uid: string) => `<@${uid}>`).join(" ");
   const fullMessage = `${mentions}\n\n${message}\n\n_Please react to this message (e.g. ✅) once you're done!_`;
 
-  // Post the nag
+  // Nag messages always go to the nag-bot channel
   const postResponse = await client.chat.postMessage({
-    channel,
+    channel: NAG_BOT_CHANNEL_ID,
     text: fullMessage,
     blocks: [
       {
@@ -370,6 +409,13 @@ export default SlackFunction(
     return { response_action: "clear" };
   }
 
+  // Bot reacts first so the ✅ reaction is primed for everyone else
+  await client.reactions.add({
+    channel: NAG_BOT_CHANNEL_ID,
+    timestamp: postResponse.ts as string,
+    name: "white_check_mark",
+  }).catch(() => {});
+
   const nagId = crypto.randomUUID();
   const now = Math.floor(Date.now() / 1000);
 
@@ -389,7 +435,7 @@ export default SlackFunction(
     datastore: "nags",
     item: {
       id: nagId,
-      channel_id: channel,
+      channel_id: NAG_BOT_CHANNEL_ID,
       message_ts: postResponse.ts as string,
       nagged_by,
       nagged_users: JSON.stringify(selectedUsers),

@@ -131,11 +131,19 @@ export default SlackFunction(
         ? "⏰ Deadline Reminder"
         : "🔁 Daily Reminder";
 
-      await client.chat.postMessage({
+      const reminderRes = await client.chat.postMessage({
         channel,
         text:
           `${headerLabel} — ${mentions}\n\nYou still need to action ${nagRef}.\n_Original ask: "${nag.message}"_${deadlineLine}`,
       });
+
+      if (reminderRes.ts) {
+        await client.reactions.add({
+          channel,
+          timestamp: reminderRes.ts as string,
+          name: "white_check_mark",
+        }).catch(() => {});
+      }
 
       // Increment nag counts for pending users
       for (const uid of pending) {

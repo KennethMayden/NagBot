@@ -8,7 +8,7 @@ A Slack app that runs entirely on **Slack's own infrastructure** (ROSI) — no s
 
 | Trigger | What it does |
 |---|---|
-| 🔔 **Send a Nag** shortcut | Opens a modal — pick who to nag, choose a nag type, write what you need, post to the channel |
+| 🔔 **Send a Nag** shortcut | Opens a modal — pick who to nag, choose a nag type, write what you need, post to the **#nag-bot channel** |
 | 🔍 **Check Nag Reactions** shortcut | Shows reaction progress on recent nags with a one-click **Re-nag** button and option to cancel recurring nags |
 | 📊 **Nag Stats** shortcut | Private leaderboard of most/least nagged people |
 | 🔁 **Daily Recurring Nag** (scheduled) | Automatically re-nags pending users at 08:00 UTC every day for active recurring nags |
@@ -139,13 +139,15 @@ nag-bot-deno/
 
 ### Sending a nag
 
-Click the **Send a Nag** link trigger (or slash command). A modal opens where you:
-- Pick who to nag — multi-select user picker, or check **Nag everyone** to tag the whole channel
+Click the **Send a Nag** link trigger (or slash command) from **any channel or message window**. A modal opens where you:
+- Pick who to nag — multi-select user picker, or check **Nag everyone** to tag every member of `#id-26-q1-nag-bot`
 - Write what you need them to do
 - Choose a **nag type** (see [Nag Types](#nag-types) above):
   - **Standard** — one-time, no automatic follow-ups
   - **Do Now** — re-nags daily until everyone reacts
   - **Do By Deadline** — set a deadline date; optionally start nagging X days before it
+
+**All nag @mentions are always posted in the `#nag-bot` channel** (`C0BDN88PS00`), regardless of which channel you triggered the command from. If any tagged users are not yet members of `#nag-bot`, they are automatically added before the message is posted.
 
 The bot posts the message tagging everyone, asking them to react (e.g. ✅) when done.
 
@@ -189,6 +191,7 @@ slack datastore query '{"datastore": "nag_counts"}'
 ## Notes
 
 - **Any reaction** counts — ✅, 👍, 🎉, whatever. The bot counts anyone who reacted at all.
+- **NagBot auto-reacts ✅** on every new nag and every reminder (initial nags, re-nags, and daily recurring reminders), so the reaction is always primed on the message.
 - All check/stats results are **ephemeral** (only you see them).
 - Recurring nags auto-cancel when everyone has reacted — no manual cleanup needed.
 - Data is stored in Slack's DynamoDB-backed datastores — no external database needed.

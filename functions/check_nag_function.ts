@@ -1,5 +1,8 @@
 import { DefineFunction, Schema, SlackFunction } from "deno-slack-sdk/mod.ts";
 
+// All nag messages live here; never post mentions elsewhere
+const NAG_BOT_CHANNEL_ID = "C0BDN88PS00";
+
 export const CheckNagFunctionDefinition = DefineFunction({
   callback_id: "check_nag_function",
   title: "Check nag reactions",
@@ -35,12 +38,12 @@ export default SlackFunction(
   async ({ inputs, client }) => {
     const { channel, checker } = inputs;
 
-    // Fetch recent nags for this channel
+    // Fetch recent nags from the nag-bot channel
     const queryRes = await client.apps.datastore.query({
       datastore: "nags",
       expression: "#channel_id = :channel_id",
       expression_attributes: { "#channel_id": "channel_id" },
-      expression_values: { ":channel_id": channel },
+      expression_values: { ":channel_id": NAG_BOT_CHANNEL_ID },
       limit: 8,
     });
 
@@ -78,10 +81,10 @@ export default SlackFunction(
       const naggedUsers: string[] = JSON.parse(nag.nagged_users as string);
       const msgTs = nag.message_ts as string;
 
-      // Fetch reactions on the original message
-      // The bot must be in the channel to call reactions.get; join first
-      // (no-op if already a member; fails silently for private channels)
-      await client.conversations.join({ channel }).catch(() => {});
+      // The bot must be in the nag-bot channel to call reactions.get
+      await client.conversations.join({ channel: NAG_BOT_CHANNEL_ID }).catch(
+        () => {},
+      );
 
       // Check reactions on the original message + any reminder messages
       const reminderTs: string[] = JSON.parse(
@@ -93,7 +96,7 @@ export default SlackFunction(
       for (const ts of timestampsToCheck) {
         try {
           const reactRes = await client.reactions.get({
-            channel,
+            channel: NAG_BOT_CHANNEL_ID,
             timestamp: ts,
             full: true,
           });
@@ -127,7 +130,7 @@ export default SlackFunction(
       let link = "";
       try {
         const pl = await client.chat.getPermalink({
-          channel,
+          channel: NAG_BOT_CHANNEL_ID,
           message_ts: msgTs,
         });
         link = pl.permalink as string;
@@ -176,7 +179,7 @@ export default SlackFunction(
           action_id: `renag_${nag.id}`,
           value: JSON.stringify({
             nagId: nag.id,
-            channel,
+            channel: NAG_BOT_CHANNEL_ID,
             pendingUsers: pending,
             originalMessage: nag.message,
             messageTs: msgTs,
@@ -286,6 +289,15 @@ export default SlackFunction(
     }
   }
 
+  // Bot reacts ✅ to prime the reaction on the reminder message
+  if (reminderPost.ts) {
+    await client.reactions.add({
+      channel: channelId,
+      timestamp: reminderPost.ts as string,
+      name: "white_check_mark",
+    }).catch(() => {});
+  }
+
   // Increment nag counts for re-nagged users
   const now = Math.floor(Date.now() / 1000);
   for (const uid of pendingUsers as string[]) {
@@ -304,9 +316,11 @@ export default SlackFunction(
     });
   }
 
-      // Confirm to the checker ephemerally
+  // Confirm to the checker ephemerally in the channel where they invoked the command
+      const invocationChannel =
+        (body.container as Record<string, string>)?.channel_id || channelId;
       await client.chat.postEphemeral({
-        channel: channelId,
+        channel: invocationChannel,
         user: checker,
         text: `✅ Re-nag sent to ${(pendingUsers as string[]).map((u) => `<@${u}>`).join(", ")}!`,
       });
@@ -336,8 +350,10 @@ export default SlackFunction(
         item: { ...res.item, is_cancelled: true },
       });
 
+      const invocationChannel =
+        (body.container as Record<string, string>)?.channel_id || channelId;
       await client.chat.postEphemeral({
-        channel: channelId,
+        channel: invocationChannel,
         user: canceller,
         text: "🚫 Recurring nag cancelled — no more automatic daily reminders for that nag.",
       });
