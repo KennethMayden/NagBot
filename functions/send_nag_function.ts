@@ -3,6 +3,53 @@ import { DefineFunction, Schema, SlackFunction } from "deno-slack-sdk/mod.ts";
 type SelectOption = { text: { type: "plain_text"; text: string }; value: string };
 type OptionGroup = { label: { type: "plain_text"; text: string }; options: SelectOption[] };
 
+// Converts a single rich_text_section elements array to a mrkdwn string
+// deno-lint-ignore no-explicit-any
+function richTextSectionToMrkdwn(elements: any[]): string {
+  return elements.map((el) => {
+    switch (el.type) {
+      case "text": {
+        let t: string = el.text ?? "";
+        const s = el.style ?? {};
+        if (s.code) return "`" + t + "`";
+        if (s.bold) t = "*" + t + "*";
+        if (s.italic) t = "_" + t + "_";
+        if (s.strike) t = "~" + t + "~";
+        return t;
+      }
+      case "emoji": return `:${el.name}:`;
+      case "link": return el.text && el.text !== el.url ? `<${el.url}|${el.text}>` : `<${el.url}>`;
+      case "user": return `<@${el.user_id}>`;
+      case "channel": return `<#${el.channel_id}>`;
+      case "usergroup": return `<!subteam^${el.usergroup_id}>`;
+      default: return "";
+    }
+  }).join("");
+}
+
+// Converts a rich_text block (from rich_text_input) to a mrkdwn string
+// deno-lint-ignore no-explicit-any
+function richTextToMrkdwn(richText: any): string {
+  if (!richText || richText.type !== "rich_text") return "";
+  return (richText.elements ?? []).map((block: any) => {
+    switch (block.type) {
+      case "rich_text_section":
+        return richTextSectionToMrkdwn(block.elements ?? []);
+      case "rich_text_preformatted":
+        return "```" + richTextSectionToMrkdwn(block.elements ?? []) + "```";
+      case "rich_text_quote":
+        return "> " + richTextSectionToMrkdwn(block.elements ?? []);
+      case "rich_text_list": {
+        return (block.elements ?? []).map((item: any, idx: number) => {
+          const text = richTextSectionToMrkdwn(item.elements ?? []);
+          return block.style === "ordered" ? `${idx + 1}. ${text}` : `• ${text}`;
+        }).join("\n");
+      }
+      default: return "";
+    }
+  }).join("\n");
+}
+
 // All nag @mentions are always posted here
 const NAG_BOT_CHANNEL_ID = "C0BDN88PS00";
 // Source channel for "Nag everyone" — pulls all members from here
@@ -155,9 +202,8 @@ function buildModalBlocks(
       block_id: "message_block",
       label: { type: "plain_text", text: "What do you need them to do?" },
       element: {
-        type: "plain_text_input",
+        type: "rich_text_input",
         action_id: "message_input",
-        multiline: true,
         placeholder: {
           type: "plain_text",
           text: "e.g. Please react ✅ once you have reviewed the Q3 report.",
@@ -377,7 +423,10 @@ export default SlackFunction(
 
   const selectedUsers = userIds;
 
-  const message: string = values.message_block.message_input.value ?? "";
+  // rich_text_input returns a rich_text block; convert it to mrkdwn
+  // deno-lint-ignore no-explicit-any
+  const richValue = (values.message_block?.message_input as any)?.rich_text_value;
+  const message: string = richValue ? richTextToMrkdwn(richValue) : ((values.message_block?.message_input as any)?.value ?? "");
 
   const nagType: string =
     values.nag_type_block?.nag_type_select?.selected_option?.value ??
