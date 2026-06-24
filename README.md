@@ -8,10 +8,11 @@ A Slack app that runs entirely on **Slack's own infrastructure** (ROSI) — no s
 
 | Trigger | What it does |
 |---|---|
-| 🔔 **Send a Nag** shortcut | Opens a modal — pick who to nag, choose a nag type, write what you need, post to the **#nag-bot channel** |
+| 🔔 **Send a Nag** shortcut | Opens a modal — pick specific people or tick **Nag everyone** to tag the whole channel; choose a nag type, write what you need, post to the channel |
 | 🔍 **Check Nag Reactions** shortcut | Shows reaction progress on recent nags with a one-click **Re-nag** button and option to cancel recurring nags |
 | 📊 **Nag Stats** shortcut | Private leaderboard of most/least nagged people |
 | 🔁 **Daily Recurring Nag** (scheduled) | Automatically re-nags pending users at 08:00 UTC every day for active recurring nags |
+| 🏁 **Nag Completion Check** (scheduled) | Runs hourly — detects when everyone has reacted, deletes the nag record, and sends the nagger a DM |
 
 Triggers appear as **link triggers** in Slack (bookmarkable URLs or slash commands you configure). Every response is **ephemeral** (only visible to you) except the actual nag messages.
 
@@ -85,6 +86,7 @@ slack triggers create --trigger-def triggers/nag.ts
 slack triggers create --trigger-def triggers/nag_check.ts
 slack triggers create --trigger-def triggers/nag_stats.ts
 slack triggers create --trigger-def triggers/recurring_nag.ts
+slack triggers create --trigger-def triggers/nag_completion_check.ts
 ```
 
 The first three output a **link trigger URL** (looks like `https://slack.com/shortcuts/...`). Share these in your workspace:
@@ -93,7 +95,7 @@ The first three output a **link trigger URL** (looks like `https://slack.com/sho
 - Add them to your Slack sidebar as bookmarks
 - Or configure them as slash commands via the app dashboard
 
-> **Note:** The `recurring_nag` trigger is a background scheduled trigger — it has no URL and requires no sharing. It fires automatically at 08:00 UTC daily. Update the `start_time` in `triggers/recurring_nag.ts` to a future date before creating it.
+> **Note:** `recurring_nag` and `nag_completion_check` are background scheduled triggers — they have no URL and require no sharing. They fire automatically on their schedules. Update the `start_time` in each trigger file to a future date before creating them.
 
 ### 5. Deploy to Slack's infrastructure
 
@@ -117,20 +119,23 @@ nag-bot-deno/
 │   ├── nags.ts                    # Stores sent nag messages (type, deadline, recurring state)
 │   └── nag_counts.ts              # Tracks nag counts per person
 ├── functions/
-│   ├── send_nag_function.ts       # Posts nag + saves to datastore (all nag types)
-│   ├── check_nag_function.ts      # Checks reactions, shows status, re-nags, cancel recurring
-│   ├── nag_stats_function.ts      # Leaderboard of most/least nagged
-│   └── recurring_nag_function.ts  # Daily: re-nags pending users on active recurring nags
+│   ├── send_nag_function.ts             # Posts nag + saves to datastore (all nag types)
+│   ├── check_nag_function.ts            # Checks reactions, shows status, re-nags, cancel recurring
+│   ├── nag_stats_function.ts            # Leaderboard of most/least nagged
+│   ├── recurring_nag_function.ts        # Daily: re-nags pending users on active recurring nags
+│   └── nag_completion_check_function.ts # Hourly: detects completed nags, cleans up, DMs nagger
 ├── workflows/
 │   ├── send_nag.ts                # Wires trigger → send nag function
 │   ├── check_nag.ts               # Wires trigger → check nag function
 │   ├── nag_stats.ts               # Wires trigger → stats function
-│   └── recurring_nag.ts           # Wires scheduled trigger → recurring nag function
+│   ├── recurring_nag.ts           # Wires scheduled trigger → recurring nag function
+│   └── nag_completion_check.ts    # Wires scheduled trigger → completion check function
 └── triggers/
     ├── nag.ts                     # Link trigger for sending nags
     ├── nag_check.ts               # Link trigger for checking reactions
     ├── nag_stats.ts               # Link trigger for leaderboard
-    └── recurring_nag.ts           # Scheduled trigger — daily at 08:00 UTC
+    ├── recurring_nag.ts           # Scheduled trigger — daily at 08:00 UTC
+    └── nag_completion_check.ts    # Scheduled trigger — hourly completion check
 ```
 
 ---
@@ -139,8 +144,8 @@ nag-bot-deno/
 
 ### Sending a nag
 
-Click the **Send a Nag** link trigger (or slash command) from **any channel or message window**. A modal opens where you:
-- Pick who to nag — multi-select user picker, or check **Nag everyone** to tag every member of `#id-26-q1-nag-bot`
+Click the **Send a Nag** link trigger (or slash command). A modal opens where you:
+- Pick who to nag — check **Nag everyone** to tag the whole channel, or pick specific people with the multi-select picker
 - Write what you need them to do
 - Choose a **nag type** (see [Nag Types](#nag-types) above):
   - **Standard** — one-time, no automatic follow-ups
@@ -157,8 +162,18 @@ Click **Check Nag Reactions**. You'll see (privately) a list of recent nags with
 - The nag type badge (`🔁 Do Now` or `⏰ Due [date]`) where applicable
 - A progress bar: `████░░░░░░ 40%  2/5 reacted`
 - Who is still pending
-- A **🔔 Re-nag them** button — sends a one-off follow-up tagging non-reactors with a link back to the original message
+- A **🔔 Re-nag them** button — sends a one-off follow-up tagging non-reactors with a link back to the original message; reacting to the reminder message also counts toward completion
 - A **🚫 Cancel Recurring** button (for Do Now / Do By Deadline nags) — stops all future automatic re-nags
+
+> Completed nags (everyone reacted) are automatically removed from this view and cleaned up.
+
+### Automatic completion notifications
+
+The **Nag Completion Check** runs hourly in the background. When it detects that everyone has reacted to a nag:
+1. The nag record is deleted from the datastore
+2. The person who sent the nag receives a **DM** with a link to the original message confirming completion
+
+This means you don't need to manually run Check Nag Reactions to get notified — the bot will message you automatically within an hour of completion.
 
 ### Viewing the leaderboard
 
@@ -192,8 +207,10 @@ slack datastore query '{"datastore": "nag_counts"}'
 
 - **Any reaction** counts — ✅, 👍, 🎉, whatever. The bot counts anyone who reacted at all.
 - **NagBot auto-reacts ✅** on every new nag and every reminder (initial nags, re-nags, and daily recurring reminders), so the reaction is always primed on the message.
+- **Reacting to a reminder message** also counts — not just the original nag.
 - All check/stats results are **ephemeral** (only you see them).
 - Recurring nags auto-cancel when everyone has reacted — no manual cleanup needed.
+- **Completion DMs** are sent automatically within ~1 hour of everyone reacting.
 - Data is stored in Slack's DynamoDB-backed datastores — no external database needed.
 - The Deno SDK requires **TypeScript** (`.ts` files). No npm, no `node_modules`.
 - Function timeout is **60 seconds** for deployed apps — more than enough for nag operations.

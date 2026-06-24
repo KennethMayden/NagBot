@@ -82,9 +82,9 @@ export default SlackFunction(
       const msgTs = nag.message_ts as string;
 
       // The bot must be in the nag-bot channel to call reactions.get
-      await client.conversations.join({ channel: NAG_BOT_CHANNEL_ID }).catch(
-        () => {},
-      );
+      await client.conversations
+        .join({ channel: NAG_BOT_CHANNEL_ID })
+        .catch(() => {});
 
       // Check reactions on the original message + any reminder messages
       const reminderTs: string[] = JSON.parse(
@@ -135,6 +135,33 @@ export default SlackFunction(
         });
         link = pl.permalink as string;
       } catch (_) {}
+
+      // If everyone has reacted, clean up and notify the nagger via DM
+      if (pending.length === 0 && naggedUsers.length > 0) {
+        await client.apps.datastore
+          .delete({
+            datastore: "nags",
+            id: nag.id as string,
+          })
+          .catch(() => {});
+
+        try {
+          const dmRes = await client.conversations.open({
+            users: nag.nagged_by as string,
+          });
+          if (dmRes.ok && dmRes.channel?.id) {
+            const nagLink = link ? `<${link}|your nag>` : "your nag";
+            await client.chat.postMessage({
+              channel: dmRes.channel.id as string,
+              text: `✅ Everyone has completed ${nagLink}!\n\n> ${(nag.message as string).slice(0, 100)}${
+                (nag.message as string).length > 100 ? "…" : ""
+              }`,
+            });
+          }
+        } catch (_) {}
+
+        continue; // Don't show completed nags in the check output
+      }
 
       const nagType = (nag.nag_type as string) ?? "standard";
       const isRecurring = nagType === "do_now" || nagType === "do_by_deadline";
@@ -241,91 +268,94 @@ export default SlackFunction(
 
     return { completed: false };
   },
-).addBlockActionsHandler(/^renag_/, async ({ action, body, client }) => {
-  const payload = JSON.parse((action as Record<string, string>).value);
-  const { nagId, channel, pendingUsers, originalMessage, messageTs } = payload;
-  const channelId = channel as string;
-  const checker = body.user.id;
+)
+  .addBlockActionsHandler(/^renag_/, async ({ action, body, client }) => {
+    const payload = JSON.parse((action as Record<string, string>).value);
+    const { nagId, channel, pendingUsers, originalMessage, messageTs } =
+      payload;
+    const channelId = channel as string;
+    const checker = body.user.id;
 
-  // Get permalink to original message
-  let permalink = "";
-  try {
-    const pl = await client.chat.getPermalink({
+    // Get permalink to original message
+    let permalink = "";
+    try {
+      const pl = await client.chat.getPermalink({
+        channel: channelId,
+        message_ts: messageTs as string,
+      });
+      permalink = pl.permalink as string;
+    } catch (_) {}
+
+    const mentions = (pendingUsers as string[])
+      .map((uid) => `<@${uid}>`)
+      .join(" ");
+
+    const reminderPost = await client.chat.postMessage({
       channel: channelId,
-      message_ts: messageTs as string,
+      text: `🔔 *Reminder!* ${mentions}\n\nYou haven't reacted to ${
+        permalink ? `<${permalink}|this message>` : "the original nag"
+      } yet.\n_Original ask: "${originalMessage}"_`,
     });
-    permalink = pl.permalink as string;
-  } catch (_) {}
 
-  const mentions = (pendingUsers as string[])
-    .map((uid) => `<@${uid}>`)
-    .join(" ");
-
-  const reminderPost = await client.chat.postMessage({
-    channel: channelId,
-    text: `🔔 *Reminder!* ${mentions}\n\nYou haven't reacted to ${
-      permalink ? `<${permalink}|this message>` : "the original nag"
-    } yet.\n_Original ask: "${originalMessage}"_`,
-  });
-
-  // Store the reminder message timestamp so reactions to it also count
-  if (reminderPost.ok && reminderPost.ts && nagId) {
-    const existing = await client.apps.datastore.get({
-      datastore: "nags",
-      id: nagId as string,
-    });
-    if (existing.ok && existing.item) {
-      const reminders: string[] = JSON.parse(
-        (existing.item.reminder_timestamps as string) || "[]",
-      );
-      reminders.push(reminderPost.ts as string);
-      await client.apps.datastore.put({
+    // Store the reminder message timestamp so reactions to it also count
+    if (reminderPost.ok && reminderPost.ts && nagId) {
+      const existing = await client.apps.datastore.get({
         datastore: "nags",
+        id: nagId as string,
+      });
+      if (existing.ok && existing.item) {
+        const reminders: string[] = JSON.parse(
+          (existing.item.reminder_timestamps as string) || "[]",
+        );
+        reminders.push(reminderPost.ts as string);
+        await client.apps.datastore.put({
+          datastore: "nags",
+          item: {
+            ...existing.item,
+            reminder_timestamps: JSON.stringify(reminders),
+          },
+        });
+      }
+    }
+
+    // Bot reacts ✅ to prime the reaction on the reminder message
+    if (reminderPost.ts) {
+      await client.reactions
+        .add({
+          channel: channelId,
+          timestamp: reminderPost.ts as string,
+          name: "white_check_mark",
+        })
+        .catch(() => {});
+    }
+
+    // Increment nag counts for re-nagged users
+    const now = Math.floor(Date.now() / 1000);
+    for (const uid of pendingUsers as string[]) {
+      const existing = await client.apps.datastore.get({
+        datastore: "nag_counts",
+        id: uid,
+      });
+      const currentCount: number = (existing.item?.total_nags as number) ?? 0;
+      await client.apps.datastore.put({
+        datastore: "nag_counts",
         item: {
-          ...existing.item,
-          reminder_timestamps: JSON.stringify(reminders),
+          user_id: uid,
+          total_nags: currentCount + 1,
+          last_nagged: now,
         },
       });
     }
-  }
 
-  // Bot reacts ✅ to prime the reaction on the reminder message
-  if (reminderPost.ts) {
-    await client.reactions.add({
-      channel: channelId,
-      timestamp: reminderPost.ts as string,
-      name: "white_check_mark",
-    }).catch(() => {});
-  }
-
-  // Increment nag counts for re-nagged users
-  const now = Math.floor(Date.now() / 1000);
-  for (const uid of pendingUsers as string[]) {
-    const existing = await client.apps.datastore.get({
-      datastore: "nag_counts",
-      id: uid,
+    // Confirm to the checker ephemerally in the channel where they invoked
+    const invocationChannel =
+      (body.container as Record<string, string>)?.channel_id || channelId;
+    await client.chat.postEphemeral({
+      channel: invocationChannel,
+      user: checker,
+      text: `✅ Re-nag sent to ${(pendingUsers as string[]).map((u) => `<@${u}>`).join(", ")}!`,
     });
-    const currentCount: number = (existing.item?.total_nags as number) ?? 0;
-    await client.apps.datastore.put({
-      datastore: "nag_counts",
-      item: {
-        user_id: uid,
-        total_nags: currentCount + 1,
-        last_nagged: now,
-      },
-    });
-  }
-
-  // Confirm to the checker ephemerally in the channel where they invoked the command
-      const invocationChannel =
-        (body.container as Record<string, string>)?.channel_id || channelId;
-      await client.chat.postEphemeral({
-        channel: invocationChannel,
-        user: checker,
-        text: `✅ Re-nag sent to ${(pendingUsers as string[]).map((u) => `<@${u}>`).join(", ")}!`,
-      });
-    },
-  )
+  })
   .addBlockActionsHandler(
     /^cancel_recurring_/,
     async ({ action, body, client }) => {
