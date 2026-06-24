@@ -79,11 +79,16 @@ export default SlackFunction(
       const msgTs = nag.message_ts as string;
 
       // Fetch reactions on the original message
+      // The bot must be in the channel to call reactions.get; join first
+      // (no-op if already a member; fails silently for private channels)
+      await client.conversations.join({ channel }).catch(() => {});
+
       let reactedUsers: string[] = [];
       try {
         const reactRes = await client.reactions.get({
           channel,
           timestamp: msgTs,
+          full: true,
         });
         const reactions =
           (reactRes.message as Record<string, unknown>)?.reactions ?? [];
@@ -101,13 +106,14 @@ export default SlackFunction(
         ? Math.round((done.length / naggedUsers.length) * 100)
         : 0;
 
-      const dateStr = new Date((nag.created_at as number) * 1000)
-        .toLocaleDateString("en-GB", {
-          day: "numeric",
-          month: "short",
-          hour: "2-digit",
-          minute: "2-digit",
-        });
+      const dateStr = new Date(
+        (nag.created_at as number) * 1000,
+      ).toLocaleDateString("en-GB", {
+        day: "numeric",
+        month: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
 
       // Build permalink
       let link = "";
@@ -173,60 +179,55 @@ export default SlackFunction(
 
     return { completed: false };
   },
-)
-  .addBlockActionsHandler(
-    /^renag_/,
-    async ({ action, body, client }) => {
-      const payload = JSON.parse((action as Record<string, string>).value);
-      const { channel, pendingUsers, originalMessage, messageTs } = payload;
-      const channelId = channel as string;
-      const checker = body.user.id;
+).addBlockActionsHandler(/^renag_/, async ({ action, body, client }) => {
+  const payload = JSON.parse((action as Record<string, string>).value);
+  const { channel, pendingUsers, originalMessage, messageTs } = payload;
+  const channelId = channel as string;
+  const checker = body.user.id;
 
-      // Get permalink to original message
-      let permalink = "";
-      try {
-        const pl = await client.chat.getPermalink({
-          channel: channelId,
-          message_ts: messageTs as string,
-        });
-        permalink = pl.permalink as string;
-      } catch (_) {}
+  // Get permalink to original message
+  let permalink = "";
+  try {
+    const pl = await client.chat.getPermalink({
+      channel: channelId,
+      message_ts: messageTs as string,
+    });
+    permalink = pl.permalink as string;
+  } catch (_) {}
 
-      const mentions = (pendingUsers as string[])
-        .map((uid) => `<@${uid}>`)
-        .join(" ");
+  const mentions = (pendingUsers as string[])
+    .map((uid) => `<@${uid}>`)
+    .join(" ");
 
-      await client.chat.postMessage({
-        channel: channelId,
-        text: `🔔 *Reminder!* ${mentions}\n\nYou haven't reacted to ${
-          permalink ? `<${permalink}|this message>` : "the original nag"
-        } yet.\n_Original ask: "${originalMessage}"_`,
-      });
+  await client.chat.postMessage({
+    channel: channelId,
+    text: `🔔 *Reminder!* ${mentions}\n\nYou haven't reacted to ${
+      permalink ? `<${permalink}|this message>` : "the original nag"
+    } yet.\n_Original ask: "${originalMessage}"_`,
+  });
 
-      // Increment nag counts for re-nagged users
-      const now = Math.floor(Date.now() / 1000);
-      for (const uid of pendingUsers as string[]) {
-        const existing = await client.apps.datastore.get({
-          datastore: "nag_counts",
-          id: uid,
-        });
-        const currentCount: number =
-          (existing.item?.total_nags as number) ?? 0;
-        await client.apps.datastore.put({
-          datastore: "nag_counts",
-          item: {
-            user_id: uid,
-            total_nags: currentCount + 1,
-            last_nagged: now,
-          },
-        });
-      }
+  // Increment nag counts for re-nagged users
+  const now = Math.floor(Date.now() / 1000);
+  for (const uid of pendingUsers as string[]) {
+    const existing = await client.apps.datastore.get({
+      datastore: "nag_counts",
+      id: uid,
+    });
+    const currentCount: number = (existing.item?.total_nags as number) ?? 0;
+    await client.apps.datastore.put({
+      datastore: "nag_counts",
+      item: {
+        user_id: uid,
+        total_nags: currentCount + 1,
+        last_nagged: now,
+      },
+    });
+  }
 
-      // Confirm to the checker ephemerally
-      await client.chat.postEphemeral({
-        channel: channelId,
-        user: checker,
-        text: `✅ Re-nag sent to ${(pendingUsers as string[]).map((u) => `<@${u}>`).join(", ")}!`,
-      });
-    },
-  );
+  // Confirm to the checker ephemerally
+  await client.chat.postEphemeral({
+    channel: channelId,
+    user: checker,
+    text: `✅ Re-nag sent to ${(pendingUsers as string[]).map((u) => `<@${u}>`).join(", ")}!`,
+  });
+});

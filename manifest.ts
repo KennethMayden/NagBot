@@ -23,6 +23,7 @@ export default Manifest({
     "datastore:read",
     "datastore:write",
     "channels:read",
+    "channels:join",
     "groups:read",
   ],
 });
