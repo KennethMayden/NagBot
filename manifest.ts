@@ -35,5 +35,6 @@ export default Manifest({
     "groups:read",
     "groups:write",
     "im:write",
+    "usergroups:read",
   ],
 });

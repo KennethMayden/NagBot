@@ -26,56 +26,19 @@ const NAG_TYPE_OPTIONS = [
   },
 ] as const;
 
-// Fetches all active usergroups and non-bot users, returns option_groups for
-// the combined multi_static_select element.
+// Fetches all active (non-deleted) usergroups as SelectOptions for the
+// groups multi_static_select element.
 // deno-lint-ignore no-explicit-any
-async function fetchCombinedOptions(client: any): Promise<OptionGroup[]> {
-  const groups: OptionGroup[] = [];
-
-  // ── Usergroups ──────────────────────────────────────────────────────────────
+async function fetchGroupOptions(client: any): Promise<SelectOption[]> {
   const ugRes = await client.usergroups.list({});
   const usergroups: { id: string; name: string; date_delete?: number }[] =
     ugRes.usergroups ?? [];
-  const groupOptions: SelectOption[] = usergroups
+  return usergroups
     .filter((ug) => !ug.date_delete)
     .map((ug) => ({
       text: { type: "plain_text" as const, text: `👥 ${ug.name}` },
       value: `group_${ug.id}`,
     }));
-  if (groupOptions.length > 0) {
-    groups.push({ label: { type: "plain_text", text: "User Groups" }, options: groupOptions });
-  }
-
-  // ── Individual users ─────────────────────────────────────────────────────────
-  let allUsers: {
-    id: string;
-    real_name?: string;
-    name?: string;
-    is_bot?: boolean;
-    deleted?: boolean;
-  }[] = [];
-  let cursor: string | undefined;
-  do {
-    const usersRes = await client.users.list({
-      limit: 200,
-      ...(cursor ? { cursor } : {}),
-    });
-    if (usersRes.error) break;
-    allUsers = allUsers.concat(usersRes.members ?? []);
-    cursor = usersRes.response_metadata?.next_cursor || undefined;
-  } while (cursor);
-
-  const userOptions: SelectOption[] = allUsers
-    .filter((u) => !u.is_bot && !u.deleted && u.id !== "USLACKBOT")
-    .map((u) => ({
-      text: { type: "plain_text" as const, text: u.real_name || u.name || u.id },
-      value: `user_${u.id}`,
-    }));
-  if (userOptions.length > 0) {
-    groups.push({ label: { type: "plain_text", text: "People" }, options: userOptions });
-  }
-
-  return groups;
 }
 
 // Blocks that only appear when "Do By Deadline" is selected
@@ -122,8 +85,9 @@ const EVERYONE_OPTION = {
 // Builds the full modal block list; conditionally includes deadline blocks and pre-filled users
 function buildModalBlocks(
   nagType: string,
-  options: OptionGroup[],
-  initialOptions?: SelectOption[],
+  groupOptions: SelectOption[],
+  initialUserIds?: string[],
+  initialGroupSelections?: SelectOption[],
   everyoneChecked = false,
 ): unknown[] {
   const selectedOption =
@@ -134,7 +98,7 @@ function buildModalBlocks(
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*Who do you want to nag?*\nPre-fill everyone in the team and remove who you like, or pick specific people or user groups.",
+        text: "*Who do you want to nag?*\nPre-fill everyone in the team and remove who you like, or pick specific people.",
       },
     },
     {
@@ -158,16 +122,34 @@ function buildModalBlocks(
         type: "plain_text",
         text: everyoneChecked
           ? "Remove anyone you don't want to nag"
-          : "Select people or user groups",
+          : "Select people to nag",
       },
       element: {
-        type: "multi_static_select",
+        type: "multi_users_select",
         action_id: "users_select",
-        placeholder: { type: "plain_text", text: "Select people or groups…" },
-        option_groups: options,
-        ...(initialOptions?.length ? { initial_options: initialOptions } : {}),
+        placeholder: { type: "plain_text", text: "Select people…" },
+        ...(initialUserIds?.length ? { initial_users: initialUserIds } : {}),
       },
     },
+    ...(groupOptions.length > 0
+      ? [
+          {
+            type: "input",
+            block_id: "groups_block",
+            optional: true,
+            label: { type: "plain_text", text: "Select user groups to nag" },
+            element: {
+              type: "multi_static_select",
+              action_id: "groups_select",
+              placeholder: { type: "plain_text", text: "Select a group…" },
+              options: groupOptions,
+              ...(initialGroupSelections?.length
+                ? { initial_options: initialGroupSelections }
+                : {}),
+            },
+          },
+        ]
+      : []),
     {
       type: "input",
       block_id: "message_block",
@@ -235,8 +217,8 @@ export const SendNagFunctionDefinition = DefineFunction({
 export default SlackFunction(
   SendNagFunctionDefinition,
   async ({ inputs, client }) => {
-    // Fetch combined options (usergroups + users) for the picker
-    const options = await fetchCombinedOptions(client);
+    // Fetch usergroup options for the groups picker
+    const groupOptions = await fetchGroupOptions(client);
 
     // Open a modal for the user to fill in nag details
     const modalResponse = await client.views.open({
@@ -251,7 +233,7 @@ export default SlackFunction(
           channel: inputs.channel,
           nagged_by: inputs.nagged_by,
         }),
-        blocks: buildModalBlocks("standard", options),
+        blocks: buildModalBlocks("standard", groupOptions),
       },
     });
 
@@ -271,17 +253,19 @@ export default SlackFunction(
     const view = body.view as {
       id: string;
       private_metadata: string;
-      state: { values: Record<string, Record<string, { selected_option?: { value: string }; selected_options?: SelectOption[] }>> };
+      state: { values: Record<string, Record<string, { selected_option?: { value: string }; selected_options?: SelectOption[]; selected_users?: string[] }>> };
     };
     const meta = JSON.parse(view.private_metadata);
     const nagType =
       view.state.values.nag_type_block?.nag_type_select?.selected_option
         ?.value ?? "standard";
 
-    // Fetch combined options (needed for re-rendering and for matching initial_options)
-    const options = await fetchCombinedOptions(client);
+    // Fetch usergroup options and preserve any already-selected group options
+    const groupOptions = await fetchGroupOptions(client);
+    const currentGroupSelections: SelectOption[] =
+      view.state.values.groups_block?.groups_select?.selected_options ?? [];
 
-    let initialOptions: SelectOption[] | undefined;
+    let initialUserIds: string[] | undefined;
     if (checked) {
       // Fetch all members of the source channel
       let allMembers: string[] = [];
@@ -299,19 +283,15 @@ export default SlackFunction(
         cursor = membersResponse.response_metadata?.next_cursor || undefined;
       } while (cursor);
 
-      // Map member IDs to the corresponding options from the fetched list
-      const memberValues = new Set(allMembers.map((uid) => `user_${uid}`));
-      initialOptions = options
-        .flatMap((og) => og.options)
-        .filter((opt) => memberValues.has(opt.value));
+      initialUserIds = allMembers;
     }
 
-    // Store prefilled option values in metadata so the submission handler can
+    // Store prefilled user IDs in metadata so the submission handler can
     // fall back to them if the user never interacts with the multi-select
-    // (initial_options alone isn't reflected in view.state.values at submit time)
+    // (initial_users alone isn't reflected in view.state.values at submit time)
     const updatedMeta = JSON.stringify({
       ...meta,
-      prefilled_options: initialOptions?.map((o) => o.value) ?? [],
+      prefilled_user_ids: initialUserIds ?? [],
     });
 
     await client.views.update({
@@ -323,7 +303,7 @@ export default SlackFunction(
         submit: { type: "plain_text", text: "Send Nag", emoji: true },
         close: { type: "plain_text", text: "Cancel" },
         private_metadata: updatedMeta,
-        blocks: buildModalBlocks(nagType, options, initialOptions, checked),
+        blocks: buildModalBlocks(nagType, groupOptions, initialUserIds, currentGroupSelections, checked),
       },
     });
   },
@@ -336,15 +316,17 @@ export default SlackFunction(
     const view = body.view as {
       id: string;
       private_metadata: string;
-      state: { values: Record<string, Record<string, { selected_options?: SelectOption[] }>> };
+      state: { values: Record<string, Record<string, { selected_options?: SelectOption[]; selected_users?: string[] }>> };
     };
 
-    // Preserve any options already selected in the multi-select
-    const currentOptions: SelectOption[] =
-      view.state.values.users_block?.users_select?.selected_options ?? [];
+    // Preserve any users/groups already selected
+    const currentUserIds: string[] =
+      view.state.values.users_block?.users_select?.selected_users ?? [];
+    const currentGroupSelections: SelectOption[] =
+      view.state.values.groups_block?.groups_select?.selected_options ?? [];
 
-    // Re-fetch options so the rebuilt modal has the full picker list
-    const options = await fetchCombinedOptions(client);
+    // Re-fetch group options so the rebuilt modal has the full picker list
+    const groupOptions = await fetchGroupOptions(client);
 
     await client.views.update({
       view_id: view.id,
@@ -357,8 +339,9 @@ export default SlackFunction(
         private_metadata: view.private_metadata,
         blocks: buildModalBlocks(
           selectedType,
-          options,
-          currentOptions.length ? currentOptions : undefined,
+          groupOptions,
+          currentUserIds.length ? currentUserIds : undefined,
+          currentGroupSelections.length ? currentGroupSelections : undefined,
         ),
       },
     });
@@ -368,24 +351,20 @@ export default SlackFunction(
   const meta = JSON.parse(view.private_metadata);
   const { channel, nagged_by } = meta;
 
-  // Use whatever is selected in the multi-select; fall back to prefilled_options
-  // if the user never touched the element after checking "Pre-fill everyone"
-  const rawSelected: SelectOption[] =
-    values.users_block?.users_select?.selected_options ?? [];
-  const selectedValues: string[] = rawSelected.length > 0
-    ? rawSelected.map((o: SelectOption) => o.value)
-    : (meta.prefilled_options ?? []);
+  // Read people from multi_users_select; fall back to prefilled_user_ids if the user
+  // never touched the element after checking "Pre-fill everyone"
+  const pickedUserIds: string[] =
+    values.users_block?.users_select?.selected_users ?? [];
+  const userIds: string[] = pickedUserIds.length > 0
+    ? pickedUserIds
+    : (meta.prefilled_user_ids ?? []);
 
-  // Separate user values from usergroup values
-  const userIds: string[] = [];
-  const groupIds: string[] = [];
-  for (const val of selectedValues) {
-    if (val.startsWith("group_")) {
-      groupIds.push(val.slice(6));
-    } else if (val.startsWith("user_")) {
-      userIds.push(val.slice(5));
-    }
-  }
+  // Read usergroups from the separate groups picker and expand to member IDs
+  const selectedGroupOptions: SelectOption[] =
+    values.groups_block?.groups_select?.selected_options ?? [];
+  const groupIds: string[] = selectedGroupOptions.map((o: SelectOption) =>
+    o.value.startsWith("group_") ? o.value.slice(6) : o.value
+  );
 
   // Expand usergroups to their members and deduplicate
   for (const gid of groupIds) {
