@@ -52,10 +52,8 @@ function richTextToMrkdwn(richText: any): string {
 
 // All nag @mentions are always posted here
 const NAG_BOT_CHANNEL_ID = "C0BDN88PS00";
-// Source channel for "Nag everyone" — pulls all members from here
-const Q1_NAG_CHANNEL_ID = "C0BB9SDDYDR";
-// switch to general channel id when we do live demo
-// const GENERAL_CHANNEL_ID = "C02FQJL1Z";
+// "Everyone in Mayden" — pulls all members from the general channel
+const GENERAL_CHANNEL_ID = "C02FQJL1Z";
 
 // Options shared between buildModalBlocks and the block_actions handler
 const NAG_TYPE_OPTIONS = [
@@ -124,8 +122,8 @@ function deadlineBlocks(): unknown[] {
   ];
 }
 
-const EVERYONE_OPTION = {
-  text: { type: "plain_text", text: "Everyone in this channel", emoji: true },
+const NAG_EVERYONE_MAYDEN_OPTION = {
+  text: { type: "plain_text", text: "Everyone in Mayden", emoji: true },
   value: "nag_everyone",
 };
 
@@ -135,7 +133,7 @@ function buildModalBlocks(
   groupOptions: SelectOption[],
   initialUserIds?: string[],
   initialGroupSelections?: SelectOption[],
-  everyoneChecked = false,
+  checkedBox: "mayden" | "channel" | null = null,
 ): unknown[] {
   const selectedOption =
     NAG_TYPE_OPTIONS.find((o) => o.value === nagType) ?? NAG_TYPE_OPTIONS[0];
@@ -149,15 +147,21 @@ function buildModalBlocks(
       },
     },
     {
-      // actions block (not input) so the checkbox fires block_actions immediately on click
+      // actions block (not input) so the checkboxes fire block_actions immediately on click
       type: "actions",
       block_id: "nag_everyone_block",
       elements: [
         {
           type: "checkboxes",
           action_id: "nag_everyone_select",
-          options: [EVERYONE_OPTION],
-          ...(everyoneChecked ? { initial_options: [EVERYONE_OPTION] } : {}),
+          options: [NAG_EVERYONE_MAYDEN_OPTION],
+          ...(checkedBox === "mayden" ? { initial_options: [NAG_EVERYONE_MAYDEN_OPTION] } : {}),
+        },
+        {
+          type: "checkboxes",
+          action_id: "nag_channel_select",
+          options: [{ text: { type: "plain_text", text: "Everyone in this channel", emoji: true }, value: "nag_channel" }],
+          ...(checkedBox === "channel" ? { initial_options: [{ text: { type: "plain_text", text: "Everyone in this channel", emoji: true }, value: "nag_channel" }] } : {}),
         },
       ],
     },
@@ -167,8 +171,10 @@ function buildModalBlocks(
       optional: true,
       label: {
         type: "plain_text",
-        text: everyoneChecked
-          ? "Remove anyone you don't want to nag"
+        text: checkedBox === "mayden"
+          ? "Remove anyone you don't want to nag (from Mayden)"
+          : checkedBox === "channel"
+          ? "Remove anyone you don't want to nag (from this channel)"
           : "Select people to nag",
       },
       element: {
@@ -313,12 +319,12 @@ export default SlackFunction(
 
     let initialUserIds: string[] | undefined;
     if (checked) {
-      // Fetch all members of the source channel
+      // Fetch all members of the Mayden general channel
       let allMembers: string[] = [];
       let cursor: string | undefined;
       do {
         const membersResponse = await client.conversations.members({
-          channel: Q1_NAG_CHANNEL_ID,
+          channel: GENERAL_CHANNEL_ID,
           limit: 200,
           ...(cursor ? { cursor } : {}),
         });
@@ -338,6 +344,7 @@ export default SlackFunction(
     const updatedMeta = JSON.stringify({
       ...meta,
       prefilled_user_ids: initialUserIds ?? [],
+      checked_box: checked ? "mayden" : null,
     });
 
     await client.views.update({
@@ -349,7 +356,68 @@ export default SlackFunction(
         submit: { type: "plain_text", text: "Send Nag", emoji: true },
         close: { type: "plain_text", text: "Cancel" },
         private_metadata: updatedMeta,
-        blocks: buildModalBlocks(nagType, groupOptions, initialUserIds, currentGroupSelections, checked),
+        blocks: buildModalBlocks(nagType, groupOptions, initialUserIds, currentGroupSelections, checked ? "mayden" : null),
+      },
+    });
+  },
+).addBlockActionsHandler(
+  "nag_channel_select",
+  async ({ action, body, client }) => {
+    const checked = (
+      action as { selected_options: { value: string }[] }
+    ).selected_options.some((o) => o.value === "nag_channel");
+
+    const view = body.view as {
+      id: string;
+      private_metadata: string;
+      state: { values: Record<string, Record<string, { selected_option?: { value: string }; selected_options?: SelectOption[]; selected_users?: string[] }>> };
+    };
+    const meta = JSON.parse(view.private_metadata);
+    const nagType =
+      view.state.values.nag_type_block?.nag_type_select?.selected_option
+        ?.value ?? "standard";
+
+    const groupOptions = await fetchGroupOptions(client);
+    const currentGroupSelections: SelectOption[] =
+      view.state.values.groups_block?.groups_select?.selected_options ?? [];
+
+    let initialUserIds: string[] | undefined;
+    if (checked) {
+      // Fetch all members of the channel the command was called from
+      let allMembers: string[] = [];
+      let cursor: string | undefined;
+      do {
+        const membersResponse = await client.conversations.members({
+          channel: meta.channel,
+          limit: 200,
+          ...(cursor ? { cursor } : {}),
+        });
+        if (membersResponse.error) break;
+        allMembers = allMembers.concat(
+          (membersResponse.members as string[]) ?? [],
+        );
+        cursor = membersResponse.response_metadata?.next_cursor || undefined;
+      } while (cursor);
+
+      initialUserIds = allMembers;
+    }
+
+    const updatedMeta = JSON.stringify({
+      ...meta,
+      prefilled_user_ids: initialUserIds ?? [],
+      checked_box: checked ? "channel" : null,
+    });
+
+    await client.views.update({
+      view_id: view.id,
+      view: {
+        type: "modal",
+        callback_id: "nag_modal",
+        title: { type: "plain_text", text: "🔔 Send a Nag", emoji: true },
+        submit: { type: "plain_text", text: "Send Nag", emoji: true },
+        close: { type: "plain_text", text: "Cancel" },
+        private_metadata: updatedMeta,
+        blocks: buildModalBlocks(nagType, groupOptions, initialUserIds, currentGroupSelections, checked ? "channel" : null),
       },
     });
   },
@@ -365,11 +433,18 @@ export default SlackFunction(
       state: { values: Record<string, Record<string, { selected_options?: SelectOption[]; selected_users?: string[] }>> };
     };
 
+    const meta = JSON.parse(view.private_metadata);
+
     // Preserve any users/groups already selected
     const currentUserIds: string[] =
       view.state.values.users_block?.users_select?.selected_users ?? [];
     const currentGroupSelections: SelectOption[] =
       view.state.values.groups_block?.groups_select?.selected_options ?? [];
+
+    // Preserve which "everyone" checkbox was active
+    const maydenChecked = (view.state.values.nag_everyone_block?.nag_everyone_select?.selected_options ?? []).length > 0;
+    const channelChecked = (view.state.values.nag_everyone_block?.nag_channel_select?.selected_options ?? []).length > 0;
+    const checkedBox: "mayden" | "channel" | null = maydenChecked ? "mayden" : channelChecked ? "channel" : null;
 
     // Re-fetch group options so the rebuilt modal has the full picker list
     const groupOptions = await fetchGroupOptions(client);
@@ -388,6 +463,7 @@ export default SlackFunction(
           groupOptions,
           currentUserIds.length ? currentUserIds : undefined,
           currentGroupSelections.length ? currentGroupSelections : undefined,
+          checkedBox,
         ),
       },
     });
