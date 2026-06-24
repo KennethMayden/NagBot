@@ -87,6 +87,51 @@ export default SlackFunction(
       )
       .join("\n");
 
+    // Fetch reaction points leaderboard
+    const pointsRes = await client.apps.datastore.query({
+      datastore: "reaction_points",
+      limit: 50,
+    });
+
+    const pointsBlocks: unknown[] = [];
+    if (pointsRes.ok && pointsRes.items?.length) {
+      const pointsStats = (pointsRes.items as Record<string, unknown>[]).sort(
+        (a, b) => (b.total_points as number) - (a.total_points as number),
+      );
+      const maxPoints = pointsStats[0].total_points as number;
+
+      const pointsRows = pointsStats
+        .slice(0, 15)
+        .map((s, i) => {
+          const bar = miniBar(s.total_points as number, maxPoints);
+          const medal = medals[i] ?? `${i + 1}.`;
+          return `${medal} <@${s.user_id}> ${bar} *${s.total_points}* pt${
+            s.total_points !== 1 ? "s" : ""
+          }`;
+        })
+        .join("\n");
+
+      pointsBlocks.push(
+        { type: "divider" },
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `*🏆 Leaderboard*\n_Points for reacting early — first gets N−1 pts, last gets 0_\n${pointsRows}`,
+          },
+        },
+        {
+          type: "context",
+          elements: [
+            {
+              type: "mrkdwn",
+              text: `_Showing ${Math.min(pointsStats.length, 15)} of ${pointsStats.length} on the board_`,
+            },
+          ],
+        },
+      );
+    }
+
     await client.chat.postEphemeral({
       channel,
       user: requester,
@@ -124,6 +169,7 @@ export default SlackFunction(
             },
           ],
         },
+        ...pointsBlocks,
       ],
     });
 

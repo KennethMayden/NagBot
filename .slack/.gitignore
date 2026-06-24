@@ -1,3 +1,4 @@
 apps.dev.json
 cache/
 .vscode/
+.DS_Store

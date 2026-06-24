@@ -1,8 +1,11 @@
 import CheckNagWorkflow from "./workflows/check_nag.ts";
+import LeaderboardConfigDatastore from "./datastores/leaderboard_config.ts";
 import { Manifest } from "deno-slack-sdk/mod.ts";
 import NagCountsDatastore from "./datastores/nag_counts.ts";
 import NagStatsWorkflow from "./workflows/nag_stats.ts";
 import NagsDatastore from "./datastores/nags.ts";
+import ReactionAddedWorkflow from "./workflows/reaction_added.ts";
+import ReactionPointsDatastore from "./datastores/reaction_points.ts";
 import RecurringNagWorkflow from "./workflows/recurring_nag.ts";
 import SendNagWorkflow from "./workflows/send_nag.ts";
 import NagCompletionCheckWorkflow from "./workflows/nag_completion_check.ts";
@@ -11,13 +14,14 @@ export default Manifest({
   name: "Nag Bot",
   description: "Nag people, track reactions, and follow up on slackers 🔔",
   icon: "assets/icon.png",
-  datastores: [NagsDatastore, NagCountsDatastore],
+  datastores: [NagsDatastore, NagCountsDatastore, ReactionPointsDatastore, LeaderboardConfigDatastore],
   workflows: [
     SendNagWorkflow,
     CheckNagWorkflow,
     NagStatsWorkflow,
     RecurringNagWorkflow,
     NagCompletionCheckWorkflow,
+    ReactionAddedWorkflow,
   ],
   outgoingDomains: [],
   botScopes: [
@@ -35,6 +39,7 @@ export default Manifest({
     "groups:read",
     "groups:write",
     "im:write",
-    "usergroups:read",
+    "pins:write",
+    "pins:read",
   ],
 });

@@ -10,7 +10,8 @@ A Slack app that runs entirely on **Slack's own infrastructure** (ROSI) — no s
 |---|---|
 | 🔔 **Send a Nag** shortcut | Opens a modal — pick specific people or tick **Nag everyone** to tag the whole channel; choose a nag type, write what you need, post to the channel |
 | 🔍 **Check Nag Reactions** shortcut | Shows reaction progress on recent nags with a one-click **Re-nag** button and option to cancel recurring nags |
-| 📊 **Nag Stats** shortcut | Private leaderboard of most/least nagged people |
+| 📊 **Nag Stats** shortcut | Private stats showing most/least nagged people plus the reaction speed points leaderboard |
+| 🏆 **Reaction Speed Leaderboard** (automatic) | Pinned public message in the nag-bot channel — posted on first reaction, updated in-place on every subsequent one |
 | 🔁 **Daily Recurring Nag** (scheduled) | Automatically re-nags pending users at 08:00 UTC every day for active recurring nags |
 | 🏁 **Nag Completion Check** (scheduled) | Runs hourly — detects when everyone has reacted, deletes the nag record, and sends the nagger a DM |
 
@@ -39,6 +40,24 @@ The original behaviour. Sends a nag message once. No automatic follow-ups — us
 - If no days-before is set, re-nags begin on the deadline day itself
 - Continues daily **after** the deadline until everyone has reacted or the nag is cancelled
 - Can be stopped early via the **🚫 Cancel Recurring** button in Check Nag Reactions
+
+---
+
+## Points System
+
+Every nag has a built-in race to react. When someone adds any reaction to a nag message:
+
+- **Points awarded = (number of nagged people) − (position)**
+- The first person to react in a nag with N people gets **N−1 points**, the second gets **N−2**, and so on down to **0 points** for the last
+- Points accumulate globally across all nags over time
+- Each person can only earn points **once per nag** — adding multiple reactions to the same message doesn't award extra points
+- The bot's own ✅ reaction (auto-added when a nag is posted) does not count
+
+### Viewing the leaderboard
+
+**Pinned message** — the first time anyone earns points, a public 🏆 Reaction Speed Leaderboard message is posted in the nag-bot channel and pinned automatically. It updates in-place every time points change, so everyone can see the live standings via the 📌 Pins icon at any time.
+
+**Nag Stats shortcut** — the ephemeral stats response also includes the points leaderboard at the bottom, alongside the existing most/least nagged counts.
 
 ---
 
@@ -85,6 +104,7 @@ After running `slack run` or `slack deploy`, create each trigger:
 slack triggers create --trigger-def triggers/nag.ts
 slack triggers create --trigger-def triggers/nag_check.ts
 slack triggers create --trigger-def triggers/nag_stats.ts
+slack triggers create --trigger-def triggers/reaction_added.ts
 slack triggers create --trigger-def triggers/recurring_nag.ts
 slack triggers create --trigger-def triggers/nag_completion_check.ts
 ```
@@ -95,7 +115,7 @@ The first three output a **link trigger URL** (looks like `https://slack.com/sho
 - Add them to your Slack sidebar as bookmarks
 - Or configure them as slash commands via the app dashboard
 
-> **Note:** `recurring_nag` and `nag_completion_check` are background scheduled triggers — they have no URL and require no sharing. They fire automatically on their schedules. Update the `start_time` in each trigger file to a future date before creating them.
+> **Note:** `reaction_added`, `recurring_nag`, and `nag_completion_check` are background triggers — they have no URL and require no sharing. `reaction_added` fires automatically whenever someone reacts in the nag-bot channel. `recurring_nag` and `nag_completion_check` fire on their schedules — update `start_time` in each file to a future date before creating them.
 
 ### 5. Deploy to Slack's infrastructure
 
@@ -116,24 +136,30 @@ nag-bot-deno/
 ├── assets/
 │   └── icon.png                   # 512×512 app icon (add your own)
 ├── datastores/
-│   ├── nags.ts                    # Stores sent nag messages (type, deadline, recurring state)
-│   └── nag_counts.ts              # Tracks nag counts per person
+│   ├── nags.ts                    # Stores sent nag messages (type, deadline, recurring state, reacted_users)
+│   ├── nag_counts.ts              # Tracks nag counts per person
+│   ├── reaction_points.ts         # Tracks accumulated leaderboard points per person
+│   └── leaderboard_config.ts      # Stores the ts of the pinned leaderboard message
 ├── functions/
 │   ├── send_nag_function.ts             # Posts nag + saves to datastore (all nag types)
 │   ├── check_nag_function.ts            # Checks reactions, shows status, re-nags, cancel recurring
-│   ├── nag_stats_function.ts            # Leaderboard of most/least nagged
+│   ├── nag_stats_function.ts            # Stats of most/least nagged + points leaderboard
+│   ├── reaction_points_function.ts      # Awards points when a nag reaction is added
+│   ├── leaderboard_message.ts           # Utility: posts/updates the pinned leaderboard message
 │   ├── recurring_nag_function.ts        # Daily: re-nags pending users on active recurring nags
 │   └── nag_completion_check_function.ts # Hourly: detects completed nags, cleans up, DMs nagger
 ├── workflows/
 │   ├── send_nag.ts                # Wires trigger → send nag function
 │   ├── check_nag.ts               # Wires trigger → check nag function
 │   ├── nag_stats.ts               # Wires trigger → stats function
+│   ├── reaction_added.ts          # Wires reaction_added event → points function
 │   ├── recurring_nag.ts           # Wires scheduled trigger → recurring nag function
 │   └── nag_completion_check.ts    # Wires scheduled trigger → completion check function
 └── triggers/
     ├── nag.ts                     # Link trigger for sending nags
     ├── nag_check.ts               # Link trigger for checking reactions
-    ├── nag_stats.ts               # Link trigger for leaderboard
+    ├── nag_stats.ts               # Link trigger for stats + leaderboard
+    ├── reaction_added.ts          # Event trigger — fires on reaction_added in nag-bot channel
     ├── recurring_nag.ts           # Scheduled trigger — daily at 08:00 UTC
     └── nag_completion_check.ts    # Scheduled trigger — hourly completion check
 ```
@@ -177,7 +203,9 @@ This means you don't need to manually run Check Nag Reactions to get notified �
 
 ### Viewing the leaderboard
 
-Click **Nag Stats**. You'll see (privately) who has been nagged the most and least across all workflows.
+Click **Nag Stats**. You'll see (privately) who has been nagged the most and least, plus the full **reaction speed points leaderboard** at the bottom.
+
+The **pinned 🏆 leaderboard message** in the nag-bot channel is always visible to everyone — find it via the 📌 Pins icon in the channel header. It is created automatically on the first reaction and updated in-place thereafter.
 
 ### Automatic daily re-nags
 
@@ -199,6 +227,8 @@ slack activity
 # Inspect datastore directly
 slack datastore query '{"datastore": "nags"}'
 slack datastore query '{"datastore": "nag_counts"}'
+slack datastore query '{"datastore": "reaction_points"}'
+slack datastore query '{"datastore": "leaderboard_config"}'
 ```
 
 ---
@@ -211,6 +241,10 @@ slack datastore query '{"datastore": "nag_counts"}'
 - All check/stats results are **ephemeral** (only you see them).
 - Recurring nags auto-cancel when everyone has reacted — no manual cleanup needed.
 - **Completion DMs** are sent automatically within ~1 hour of everyone reacting.
+- **Points are earned once per nag per person** — reacting multiple times to the same message only awards points on the first reaction.
+- **The bot's own ✅ reaction does not earn points** — only nagged users are eligible.
+- **Reacting to a reminder message earns the same points** as reacting to the original nag message.
+- The pinned leaderboard message is created automatically on first use — no manual setup needed.
 - Data is stored in Slack's DynamoDB-backed datastores — no external database needed.
 - The Deno SDK requires **TypeScript** (`.ts` files). No npm, no `node_modules`.
 - Function timeout is **60 seconds** for deployed apps — more than enough for nag operations.

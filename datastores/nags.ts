@@ -17,5 +17,6 @@ export default DefineDatastore({
     days_before: { type: Schema.types.integer }, // days before deadline to begin daily nags
     is_cancelled: { type: Schema.types.boolean }, // true stops further automatic re-nags
     reminder_timestamps: { type: Schema.types.string }, // JSON-encoded array of reminder message timestamps
+    reacted_users: { type: Schema.types.string }, // JSON-encoded array of user IDs already awarded points for this nag
   },
 });
