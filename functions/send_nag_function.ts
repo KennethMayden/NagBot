@@ -78,7 +78,7 @@ function deadlineBlocks(): unknown[] {
 }
 
 const EVERYONE_OPTION = {
-  text: { type: "plain_text", text: "Pre-fill everyone in the team", emoji: true },
+  text: { type: "plain_text", text: "Everyone in this channel", emoji: true },
   value: "nag_everyone",
 };
 
@@ -418,7 +418,7 @@ export default SlackFunction(
       response_action: "errors",
       errors: {
         users_block:
-          "Please select at least one person, or use 'Pre-fill everyone'.",
+          "Please select at least one person.",
       },
     };
   }
