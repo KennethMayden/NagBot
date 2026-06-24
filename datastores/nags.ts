@@ -12,5 +12,9 @@ export default DefineDatastore({
     nagged_users: { type: Schema.types.string }, // JSON-encoded array of user IDs
     message: { type: Schema.types.string },
     created_at: { type: Schema.types.integer },
+    nag_type: { type: Schema.types.string }, // "standard" | "do_now" | "do_by_deadline"
+    deadline: { type: Schema.types.integer }, // unix timestamp; for do_by_deadline nags
+    days_before: { type: Schema.types.integer }, // days before deadline to begin daily nags
+    is_cancelled: { type: Schema.types.boolean }, // true stops further automatic re-nags
   },
 });

@@ -125,8 +125,27 @@ export default SlackFunction(
         link = pl.permalink as string;
       } catch (_) {}
 
+      const nagType = (nag.nag_type as string) ?? "standard";
+      const isRecurring = nagType === "do_now" || nagType === "do_by_deadline";
+      const isCancelled = nag.is_cancelled as boolean | undefined;
+
+      let typeLabel = "";
+      if (nagType === "do_now") {
+        typeLabel = isCancelled ? " _(🔁 Do Now — cancelled)_" : " _🔁 Do Now_";
+      } else if (nagType === "do_by_deadline") {
+        const deadlineStr = nag.deadline
+          ? new Date((nag.deadline as number) * 1000).toLocaleDateString(
+              "en-GB",
+              { day: "numeric", month: "short", year: "numeric" },
+            )
+          : "no date set";
+        typeLabel = isCancelled
+          ? ` _(⏰ Deadline: ${deadlineStr} — cancelled)_`
+          : ` _⏰ Due ${deadlineStr}_`;
+      }
+
       const nagText = [
-        `*${link ? `<${link}|Nag>` : "Nag"}* from <@${nag.nagged_by}> • _${dateStr}_`,
+        `*${link ? `<${link}|Nag>` : "Nag"}* from <@${nag.nagged_by}> • _${dateStr}_${typeLabel}`,
         `> ${(nag.message as string).slice(0, 100)}${
           (nag.message as string).length > 100 ? "…" : ""
         }`,
@@ -167,6 +186,38 @@ export default SlackFunction(
       }
 
       blocks.push(block);
+
+      // Add cancel button for active recurring nags
+      if (isRecurring && !isCancelled) {
+        blocks.push({
+          type: "actions",
+          elements: [
+            {
+              type: "button",
+              text: {
+                type: "plain_text",
+                text: "🚫 Cancel Recurring",
+                emoji: true,
+              },
+              action_id: `cancel_recurring_${nag.id}`,
+              value: nag.id as string,
+              confirm: {
+                title: {
+                  type: "plain_text",
+                  text: "Cancel recurring nag?",
+                },
+                text: {
+                  type: "mrkdwn",
+                  text: "This stops all future automatic daily re-nags for this nag.",
+                },
+                confirm: { type: "plain_text", text: "Yes, cancel it" },
+                deny: { type: "plain_text", text: "Keep going" },
+              },
+            },
+          ],
+        });
+      }
+
       blocks.push({ type: "divider" });
     }
 
@@ -224,10 +275,42 @@ export default SlackFunction(
     });
   }
 
-  // Confirm to the checker ephemerally
-  await client.chat.postEphemeral({
-    channel: channelId,
-    user: checker,
-    text: `✅ Re-nag sent to ${(pendingUsers as string[]).map((u) => `<@${u}>`).join(", ")}!`,
-  });
-});
+      // Confirm to the checker ephemerally
+      await client.chat.postEphemeral({
+        channel: channelId,
+        user: checker,
+        text: `✅ Re-nag sent to ${(pendingUsers as string[]).map((u) => `<@${u}>`).join(", ")}!`,
+      });
+    },
+  )
+  .addBlockActionsHandler(
+    /^cancel_recurring_/,
+    async ({ action, body, client }) => {
+      const nagId = (action as Record<string, string>).value;
+      const canceller = body.user.id;
+
+      // Fetch the nag to get channel and current data
+      const res = await client.apps.datastore.get({
+        datastore: "nags",
+        id: nagId,
+      });
+
+      if (!res.ok || !res.item) {
+        return; // Nothing to cancel
+      }
+
+      const channelId = res.item.channel_id as string;
+
+      // Mark as cancelled (full replace required by datastore)
+      await client.apps.datastore.put({
+        datastore: "nags",
+        item: { ...res.item, is_cancelled: true },
+      });
+
+      await client.chat.postEphemeral({
+        channel: channelId,
+        user: canceller,
+        text: "🚫 Recurring nag cancelled — no more automatic daily reminders for that nag.",
+      });
+    },
+  );
