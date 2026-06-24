@@ -1,5 +1,8 @@
 import { DefineFunction, Schema, SlackFunction } from "deno-slack-sdk/mod.ts";
 
+type SelectOption = { text: { type: "plain_text"; text: string }; value: string };
+type OptionGroup = { label: { type: "plain_text"; text: string }; options: SelectOption[] };
+
 // All nag @mentions are always posted here
 const NAG_BOT_CHANNEL_ID = "C0BDN88PS00";
 // Source channel for "Nag everyone" — pulls all members from here
@@ -22,6 +25,58 @@ const NAG_TYPE_OPTIONS = [
     value: "do_by_deadline",
   },
 ] as const;
+
+// Fetches all active usergroups and non-bot users, returns option_groups for
+// the combined multi_static_select element.
+// deno-lint-ignore no-explicit-any
+async function fetchCombinedOptions(client: any): Promise<OptionGroup[]> {
+  const groups: OptionGroup[] = [];
+
+  // ── Usergroups ──────────────────────────────────────────────────────────────
+  const ugRes = await client.usergroups.list({});
+  const usergroups: { id: string; name: string; date_delete?: number }[] =
+    ugRes.usergroups ?? [];
+  const groupOptions: SelectOption[] = usergroups
+    .filter((ug) => !ug.date_delete)
+    .map((ug) => ({
+      text: { type: "plain_text" as const, text: `👥 ${ug.name}` },
+      value: `group_${ug.id}`,
+    }));
+  if (groupOptions.length > 0) {
+    groups.push({ label: { type: "plain_text", text: "User Groups" }, options: groupOptions });
+  }
+
+  // ── Individual users ─────────────────────────────────────────────────────────
+  let allUsers: {
+    id: string;
+    real_name?: string;
+    name?: string;
+    is_bot?: boolean;
+    deleted?: boolean;
+  }[] = [];
+  let cursor: string | undefined;
+  do {
+    const usersRes = await client.users.list({
+      limit: 200,
+      ...(cursor ? { cursor } : {}),
+    });
+    if (usersRes.error) break;
+    allUsers = allUsers.concat(usersRes.members ?? []);
+    cursor = usersRes.response_metadata?.next_cursor || undefined;
+  } while (cursor);
+
+  const userOptions: SelectOption[] = allUsers
+    .filter((u) => !u.is_bot && !u.deleted && u.id !== "USLACKBOT")
+    .map((u) => ({
+      text: { type: "plain_text" as const, text: u.real_name || u.name || u.id },
+      value: `user_${u.id}`,
+    }));
+  if (userOptions.length > 0) {
+    groups.push({ label: { type: "plain_text", text: "People" }, options: userOptions });
+  }
+
+  return groups;
+}
 
 // Blocks that only appear when "Do By Deadline" is selected
 function deadlineBlocks(): unknown[] {
@@ -67,7 +122,8 @@ const EVERYONE_OPTION = {
 // Builds the full modal block list; conditionally includes deadline blocks and pre-filled users
 function buildModalBlocks(
   nagType: string,
-  initialUsers?: string[],
+  options: OptionGroup[],
+  initialOptions?: SelectOption[],
   everyoneChecked = false,
 ): unknown[] {
   const selectedOption =
@@ -78,7 +134,7 @@ function buildModalBlocks(
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*Who do you want to nag?*\nPre-fill everyone in the team and remove who you like, or pick specific people.",
+        text: "*Who do you want to nag?*\nPre-fill everyone in the team and remove who you like, or pick specific people or user groups.",
       },
     },
     {
@@ -102,13 +158,14 @@ function buildModalBlocks(
         type: "plain_text",
         text: everyoneChecked
           ? "Remove anyone you don't want to nag"
-          : "Or pick specific people",
+          : "Select people or user groups",
       },
       element: {
-        type: "multi_users_select",
+        type: "multi_static_select",
         action_id: "users_select",
-        placeholder: { type: "plain_text", text: "Select people…" },
-        ...(initialUsers?.length ? { initial_users: initialUsers } : {}),
+        placeholder: { type: "plain_text", text: "Select people or groups…" },
+        option_groups: options,
+        ...(initialOptions?.length ? { initial_options: initialOptions } : {}),
       },
     },
     {
@@ -178,6 +235,9 @@ export const SendNagFunctionDefinition = DefineFunction({
 export default SlackFunction(
   SendNagFunctionDefinition,
   async ({ inputs, client }) => {
+    // Fetch combined options (usergroups + users) for the picker
+    const options = await fetchCombinedOptions(client);
+
     // Open a modal for the user to fill in nag details
     const modalResponse = await client.views.open({
       interactivity_pointer: inputs.interactivity.interactivity_pointer,
@@ -191,7 +251,7 @@ export default SlackFunction(
           channel: inputs.channel,
           nagged_by: inputs.nagged_by,
         }),
-        blocks: buildModalBlocks("standard"),
+        blocks: buildModalBlocks("standard", options),
       },
     });
 
@@ -211,17 +271,21 @@ export default SlackFunction(
     const view = body.view as {
       id: string;
       private_metadata: string;
-      state: { values: Record<string, Record<string, { selected_option?: { value: string }; selected_users?: string[] }>> };
+      state: { values: Record<string, Record<string, { selected_option?: { value: string }; selected_options?: SelectOption[] }>> };
     };
     const meta = JSON.parse(view.private_metadata);
     const nagType =
       view.state.values.nag_type_block?.nag_type_select?.selected_option
         ?.value ?? "standard";
 
-    let initialUsers: string[] | undefined;
+    // Fetch combined options (needed for re-rendering and for matching initial_options)
+    const options = await fetchCombinedOptions(client);
+
+    let initialOptions: SelectOption[] | undefined;
     if (checked) {
+      // Fetch all members of the source channel
       let allMembers: string[] = [];
-      let cursor: string | undefined = undefined;
+      let cursor: string | undefined;
       do {
         const membersResponse = await client.conversations.members({
           channel: Q1_NAG_CHANNEL_ID,
@@ -234,15 +298,20 @@ export default SlackFunction(
         );
         cursor = membersResponse.response_metadata?.next_cursor || undefined;
       } while (cursor);
-      initialUsers = allMembers;
+
+      // Map member IDs to the corresponding options from the fetched list
+      const memberValues = new Set(allMembers.map((uid) => `user_${uid}`));
+      initialOptions = options
+        .flatMap((og) => og.options)
+        .filter((opt) => memberValues.has(opt.value));
     }
 
-    // Store prefilled users in metadata so submission can read them if the
-    // user never interacts with the multi-select (initial_users alone isn't
-    // reflected in view.state.values at submit time)
+    // Store prefilled option values in metadata so the submission handler can
+    // fall back to them if the user never interacts with the multi-select
+    // (initial_options alone isn't reflected in view.state.values at submit time)
     const updatedMeta = JSON.stringify({
       ...meta,
-      prefilled_users: initialUsers ?? [],
+      prefilled_options: initialOptions?.map((o) => o.value) ?? [],
     });
 
     await client.views.update({
@@ -254,7 +323,7 @@ export default SlackFunction(
         submit: { type: "plain_text", text: "Send Nag", emoji: true },
         close: { type: "plain_text", text: "Cancel" },
         private_metadata: updatedMeta,
-        blocks: buildModalBlocks(nagType, initialUsers, checked),
+        blocks: buildModalBlocks(nagType, options, initialOptions, checked),
       },
     });
   },
@@ -267,12 +336,15 @@ export default SlackFunction(
     const view = body.view as {
       id: string;
       private_metadata: string;
-      state: { values: Record<string, Record<string, { selected_users?: string[] }>> };
+      state: { values: Record<string, Record<string, { selected_options?: SelectOption[] }>> };
     };
 
-    // Preserve any users already in the multi-select
-    const currentUsers: string[] =
-      view.state.values.users_block?.users_select?.selected_users ?? [];
+    // Preserve any options already selected in the multi-select
+    const currentOptions: SelectOption[] =
+      view.state.values.users_block?.users_select?.selected_options ?? [];
+
+    // Re-fetch options so the rebuilt modal has the full picker list
+    const options = await fetchCombinedOptions(client);
 
     await client.views.update({
       view_id: view.id,
@@ -285,7 +357,8 @@ export default SlackFunction(
         private_metadata: view.private_metadata,
         blocks: buildModalBlocks(
           selectedType,
-          currentUsers.length ? currentUsers : undefined,
+          options,
+          currentOptions.length ? currentOptions : undefined,
         ),
       },
     });
@@ -295,12 +368,35 @@ export default SlackFunction(
   const meta = JSON.parse(view.private_metadata);
   const { channel, nagged_by } = meta;
 
-  // Use whoever is in the multi-select; fall back to prefilled_users if the
-  // user never touched the element after checking "Pre-fill everyone"
-  const selectedUsers: string[] =
-    (values.users_block?.users_select?.selected_users ?? []).length > 0
-      ? values.users_block.users_select.selected_users
-      : (meta.prefilled_users ?? []);
+  // Use whatever is selected in the multi-select; fall back to prefilled_options
+  // if the user never touched the element after checking "Pre-fill everyone"
+  const rawSelected: SelectOption[] =
+    values.users_block?.users_select?.selected_options ?? [];
+  const selectedValues: string[] = rawSelected.length > 0
+    ? rawSelected.map((o: SelectOption) => o.value)
+    : (meta.prefilled_options ?? []);
+
+  // Separate user values from usergroup values
+  const userIds: string[] = [];
+  const groupIds: string[] = [];
+  for (const val of selectedValues) {
+    if (val.startsWith("group_")) {
+      groupIds.push(val.slice(6));
+    } else if (val.startsWith("user_")) {
+      userIds.push(val.slice(5));
+    }
+  }
+
+  // Expand usergroups to their members and deduplicate
+  for (const gid of groupIds) {
+    const ugUsersRes = await client.usergroups.users.list({ usergroup: gid });
+    const members: string[] = (ugUsersRes as { users?: string[] }).users ?? [];
+    for (const uid of members) {
+      if (!userIds.includes(uid)) userIds.push(uid);
+    }
+  }
+
+  const selectedUsers = userIds;
 
   const message: string = values.message_block.message_input.value ?? "";
 
