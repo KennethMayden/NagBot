@@ -230,6 +230,14 @@ export default SlackFunction(
       initialUsers = allMembers.filter((uid) => uid !== meta.nagged_by);
     }
 
+    // Store prefilled users in metadata so submission can read them if the
+    // user never interacts with the multi-select (initial_users alone isn't
+    // reflected in view.state.values at submit time)
+    const updatedMeta = JSON.stringify({
+      ...meta,
+      prefilled_users: initialUsers ?? [],
+    });
+
     await client.views.update({
       view_id: view.id,
       view: {
@@ -238,7 +246,7 @@ export default SlackFunction(
         title: { type: "plain_text", text: "🔔 Send a Nag", emoji: true },
         submit: { type: "plain_text", text: "Send Nag", emoji: true },
         close: { type: "plain_text", text: "Cancel" },
-        private_metadata: view.private_metadata,
+        private_metadata: updatedMeta,
         blocks: buildModalBlocks(nagType, initialUsers, checked),
       },
     });
@@ -280,8 +288,12 @@ export default SlackFunction(
   const meta = JSON.parse(view.private_metadata);
   const { channel, nagged_by } = meta;
 
+  // Use whoever is in the multi-select; fall back to prefilled_users if the
+  // user never touched the element after checking "Pre-fill everyone"
   const selectedUsers: string[] =
-    values.users_block?.users_select?.selected_users ?? [];
+    (values.users_block?.users_select?.selected_users ?? []).length > 0
+      ? values.users_block.users_select.selected_users
+      : (meta.prefilled_users ?? []);
 
   const message: string = values.message_block.message_input.value ?? "";
 
