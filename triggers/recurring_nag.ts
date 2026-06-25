@@ -13,9 +13,9 @@ const RecurringNagTrigger: Trigger<typeof RecurringNagWorkflow.definition> = {
   workflow: `#/workflows/${RecurringNagWorkflow.definition.callback_id}`,
   schedule: {
     // start_time must be a future UTC datetime; update if this is in the past
-    start_time: new Date(new Date().getTime() + 60000).toISOString(),
+    start_time: "2026-06-26T08:00:00Z",
     frequency: {
-      type: "hourly",
+      type: "daily",
     },
   },
   inputs: {},
