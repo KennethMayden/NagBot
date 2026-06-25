@@ -1,53 +1,76 @@
 import { DefineFunction, Schema, SlackFunction } from "deno-slack-sdk/mod.ts";
 
-type SelectOption = { text: { type: "plain_text"; text: string }; value: string };
-type OptionGroup = { label: { type: "plain_text"; text: string }; options: SelectOption[] };
+type SelectOption = {
+  text: { type: "plain_text"; text: string };
+  value: string;
+};
+type OptionGroup = {
+  label: { type: "plain_text"; text: string };
+  options: SelectOption[];
+};
 
 // Converts a single rich_text_section elements array to a mrkdwn string
 // deno-lint-ignore no-explicit-any
 function richTextSectionToMrkdwn(elements: any[]): string {
-  return elements.map((el) => {
-    switch (el.type) {
-      case "text": {
-        let t: string = el.text ?? "";
-        const s = el.style ?? {};
-        if (s.code) return "`" + t + "`";
-        if (s.bold) t = "*" + t + "*";
-        if (s.italic) t = "_" + t + "_";
-        if (s.strike) t = "~" + t + "~";
-        return t;
+  return elements
+    .map((el) => {
+      switch (el.type) {
+        case "text": {
+          let t: string = el.text ?? "";
+          const s = el.style ?? {};
+          if (s.code) return "`" + t + "`";
+          if (s.bold) t = "*" + t + "*";
+          if (s.italic) t = "_" + t + "_";
+          if (s.strike) t = "~" + t + "~";
+          return t;
+        }
+        case "emoji":
+          return `:${el.name}:`;
+        case "link":
+          return el.text && el.text !== el.url
+            ? `<${el.url}|${el.text}>`
+            : `<${el.url}>`;
+        case "user":
+          return `<@${el.user_id}>`;
+        case "channel":
+          return `<#${el.channel_id}>`;
+        case "usergroup":
+          return `<!subteam^${el.usergroup_id}>`;
+        default:
+          return "";
       }
-      case "emoji": return `:${el.name}:`;
-      case "link": return el.text && el.text !== el.url ? `<${el.url}|${el.text}>` : `<${el.url}>`;
-      case "user": return `<@${el.user_id}>`;
-      case "channel": return `<#${el.channel_id}>`;
-      case "usergroup": return `<!subteam^${el.usergroup_id}>`;
-      default: return "";
-    }
-  }).join("");
+    })
+    .join("");
 }
 
 // Converts a rich_text block (from rich_text_input) to a mrkdwn string
 // deno-lint-ignore no-explicit-any
 function richTextToMrkdwn(richText: any): string {
   if (!richText || richText.type !== "rich_text") return "";
-  return (richText.elements ?? []).map((block: any) => {
-    switch (block.type) {
-      case "rich_text_section":
-        return richTextSectionToMrkdwn(block.elements ?? []);
-      case "rich_text_preformatted":
-        return "```" + richTextSectionToMrkdwn(block.elements ?? []) + "```";
-      case "rich_text_quote":
-        return "> " + richTextSectionToMrkdwn(block.elements ?? []);
-      case "rich_text_list": {
-        return (block.elements ?? []).map((item: any, idx: number) => {
-          const text = richTextSectionToMrkdwn(item.elements ?? []);
-          return block.style === "ordered" ? `${idx + 1}. ${text}` : `• ${text}`;
-        }).join("\n");
+  return (richText.elements ?? [])
+    .map((block: any) => {
+      switch (block.type) {
+        case "rich_text_section":
+          return richTextSectionToMrkdwn(block.elements ?? []);
+        case "rich_text_preformatted":
+          return "```" + richTextSectionToMrkdwn(block.elements ?? []) + "```";
+        case "rich_text_quote":
+          return "> " + richTextSectionToMrkdwn(block.elements ?? []);
+        case "rich_text_list": {
+          return (block.elements ?? [])
+            .map((item: any, idx: number) => {
+              const text = richTextSectionToMrkdwn(item.elements ?? []);
+              return block.style === "ordered"
+                ? `${idx + 1}. ${text}`
+                : `• ${text}`;
+            })
+            .join("\n");
+        }
+        default:
+          return "";
       }
-      default: return "";
-    }
-  }).join("\n");
+    })
+    .join("\n");
 }
 
 // All nag @mentions are always posted here
@@ -84,6 +107,50 @@ async function fetchGroupOptions(client: any): Promise<SelectOption[]> {
       text: { type: "plain_text" as const, text: `👥 ${ug.name}` },
       value: `group_${ug.id}`,
     }));
+}
+
+// Fetches all human (non-bot, non-deleted) members of a channel.
+// Uses users.list to build a bot-ID set then filters channel members against it.
+// deno-lint-ignore no-explicit-any
+async function fetchHumanChannelMembers(
+  client: any,
+  channelId: string,
+): Promise<string[]> {
+  // 1. Get all channel member IDs
+  let memberIds: string[] = [];
+  let memberCursor: string | undefined;
+  do {
+    const res = await client.conversations.members({
+      channel: channelId,
+      limit: 200,
+      ...(memberCursor ? { cursor: memberCursor } : {}),
+    });
+    if (res.error) break;
+    memberIds = memberIds.concat((res.members as string[]) ?? []);
+    memberCursor = res.response_metadata?.next_cursor || undefined;
+  } while (memberCursor);
+
+  // 2. Build a set of bot/deleted user IDs from the workspace user list
+  const botIds = new Set<string>();
+  let userCursor: string | undefined;
+  do {
+    const res = await client.users.list({
+      limit: 200,
+      ...(userCursor ? { cursor: userCursor } : {}),
+    });
+    if (res.error) break;
+    for (const u of (res.members as {
+      id: string;
+      is_bot: boolean;
+      deleted: boolean;
+    }[]) ?? []) {
+      if (u.is_bot || u.deleted) botIds.add(u.id);
+    }
+    userCursor = res.response_metadata?.next_cursor || undefined;
+  } while (userCursor);
+
+  // 3. Return only human members
+  return memberIds.filter((uid) => !botIds.has(uid));
 }
 
 // Blocks that only appear when "Do By Deadline" is selected
@@ -155,13 +222,37 @@ function buildModalBlocks(
           type: "checkboxes",
           action_id: "nag_everyone_select",
           options: [NAG_EVERYONE_MAYDEN_OPTION],
-          ...(checkedBox === "mayden" ? { initial_options: [NAG_EVERYONE_MAYDEN_OPTION] } : {}),
+          ...(checkedBox === "mayden"
+            ? { initial_options: [NAG_EVERYONE_MAYDEN_OPTION] }
+            : {}),
         },
         {
           type: "checkboxes",
           action_id: "nag_channel_select",
-          options: [{ text: { type: "plain_text", text: "Everyone in this channel", emoji: true }, value: "nag_channel" }],
-          ...(checkedBox === "channel" ? { initial_options: [{ text: { type: "plain_text", text: "Everyone in this channel", emoji: true }, value: "nag_channel" }] } : {}),
+          options: [
+            {
+              text: {
+                type: "plain_text",
+                text: "Everyone in this channel",
+                emoji: true,
+              },
+              value: "nag_channel",
+            },
+          ],
+          ...(checkedBox === "channel"
+            ? {
+                initial_options: [
+                  {
+                    text: {
+                      type: "plain_text",
+                      text: "Everyone in this channel",
+                      emoji: true,
+                    },
+                    value: "nag_channel",
+                  },
+                ],
+              }
+            : {}),
         },
       ],
     },
@@ -171,11 +262,12 @@ function buildModalBlocks(
       optional: true,
       label: {
         type: "plain_text",
-        text: checkedBox === "mayden"
-          ? "Remove anyone you don't want to nag (from Mayden)"
-          : checkedBox === "channel"
-          ? "Remove anyone you don't want to nag (from this channel)"
-          : "Select people to nag",
+        text:
+          checkedBox === "mayden"
+            ? "Remove anyone you don't want to nag (from Mayden)"
+            : checkedBox === "channel"
+              ? "Remove anyone you don't want to nag (from this channel)"
+              : "Select people to nag",
       },
       element: {
         type: "multi_users_select",
@@ -295,383 +387,441 @@ export default SlackFunction(
 
     return { completed: false };
   },
-).addBlockActionsHandler(
-  "nag_everyone_select",
-  async ({ action, body, client }) => {
-    const checked = (
-      action as { selected_options: { value: string }[] }
-    ).selected_options.some((o) => o.value === "nag_everyone");
+)
+  .addBlockActionsHandler(
+    "nag_everyone_select",
+    async ({ action, body, client }) => {
+      const checked = (
+        action as { selected_options: { value: string }[] }
+      ).selected_options.some((o) => o.value === "nag_everyone");
 
-    const view = body.view as {
-      id: string;
-      private_metadata: string;
-      state: { values: Record<string, Record<string, { selected_option?: { value: string }; selected_options?: SelectOption[]; selected_users?: string[] }>> };
-    };
-    const meta = JSON.parse(view.private_metadata);
-    const nagType =
-      view.state.values.nag_type_block?.nag_type_select?.selected_option
-        ?.value ?? "standard";
-
-    // Fetch usergroup options and preserve any already-selected group options
-    const groupOptions = await fetchGroupOptions(client);
-    const currentGroupSelections: SelectOption[] =
-      view.state.values.groups_block?.groups_select?.selected_options ?? [];
-
-    let initialUserIds: string[] | undefined;
-    if (checked) {
-      // Fetch all members of the Mayden general channel
-      let allMembers: string[] = [];
-      let cursor: string | undefined;
-      do {
-        const membersResponse = await client.conversations.members({
-          channel: GENERAL_CHANNEL_ID,
-          limit: 200,
-          ...(cursor ? { cursor } : {}),
-        });
-        if (membersResponse.error) break;
-        allMembers = allMembers.concat(
-          (membersResponse.members as string[]) ?? [],
-        );
-        cursor = membersResponse.response_metadata?.next_cursor || undefined;
-      } while (cursor);
-
-      initialUserIds = allMembers;
-    }
-
-    // Store prefilled user IDs in metadata so the submission handler can
-    // fall back to them if the user never interacts with the multi-select
-    // (initial_users alone isn't reflected in view.state.values at submit time)
-    const updatedMeta = JSON.stringify({
-      ...meta,
-      prefilled_user_ids: initialUserIds ?? [],
-      checked_box: checked ? "mayden" : null,
-    });
-
-    await client.views.update({
-      view_id: view.id,
-      view: {
-        type: "modal",
-        callback_id: "nag_modal",
-        title: { type: "plain_text", text: "🔔 Send a Nag", emoji: true },
-        submit: { type: "plain_text", text: "Send Nag", emoji: true },
-        close: { type: "plain_text", text: "Cancel" },
-        private_metadata: updatedMeta,
-        blocks: buildModalBlocks(nagType, groupOptions, initialUserIds, currentGroupSelections, checked ? "mayden" : null),
-      },
-    });
-  },
-).addBlockActionsHandler(
-  "nag_channel_select",
-  async ({ action, body, client }) => {
-    const checked = (
-      action as { selected_options: { value: string }[] }
-    ).selected_options.some((o) => o.value === "nag_channel");
-
-    const view = body.view as {
-      id: string;
-      private_metadata: string;
-      state: { values: Record<string, Record<string, { selected_option?: { value: string }; selected_options?: SelectOption[]; selected_users?: string[] }>> };
-    };
-    const meta = JSON.parse(view.private_metadata);
-    const nagType =
-      view.state.values.nag_type_block?.nag_type_select?.selected_option
-        ?.value ?? "standard";
-
-    const groupOptions = await fetchGroupOptions(client);
-    const currentGroupSelections: SelectOption[] =
-      view.state.values.groups_block?.groups_select?.selected_options ?? [];
-
-    let initialUserIds: string[] | undefined;
-    if (checked) {
-      // Fetch all members of the channel the command was called from
-      let allMembers: string[] = [];
-      let cursor: string | undefined;
-      do {
-        const membersResponse = await client.conversations.members({
-          channel: meta.channel,
-          limit: 200,
-          ...(cursor ? { cursor } : {}),
-        });
-        if (membersResponse.error) break;
-        allMembers = allMembers.concat(
-          (membersResponse.members as string[]) ?? [],
-        );
-        cursor = membersResponse.response_metadata?.next_cursor || undefined;
-      } while (cursor);
-
-      initialUserIds = allMembers;
-    }
-
-    const updatedMeta = JSON.stringify({
-      ...meta,
-      prefilled_user_ids: initialUserIds ?? [],
-      checked_box: checked ? "channel" : null,
-    });
-
-    await client.views.update({
-      view_id: view.id,
-      view: {
-        type: "modal",
-        callback_id: "nag_modal",
-        title: { type: "plain_text", text: "🔔 Send a Nag", emoji: true },
-        submit: { type: "plain_text", text: "Send Nag", emoji: true },
-        close: { type: "plain_text", text: "Cancel" },
-        private_metadata: updatedMeta,
-        blocks: buildModalBlocks(nagType, groupOptions, initialUserIds, currentGroupSelections, checked ? "channel" : null),
-      },
-    });
-  },
-).addBlockActionsHandler(
-  "nag_type_select",
-  async ({ action, body, client }) => {
-    const selectedType =
-      (action as { selected_option: { value: string } }).selected_option
-        .value;
-    const view = body.view as {
-      id: string;
-      private_metadata: string;
-      state: { values: Record<string, Record<string, { selected_options?: SelectOption[]; selected_users?: string[] }>> };
-    };
-
-    const meta = JSON.parse(view.private_metadata);
-
-    // Preserve any users/groups already selected
-    const currentUserIds: string[] =
-      view.state.values.users_block?.users_select?.selected_users ?? [];
-    const currentGroupSelections: SelectOption[] =
-      view.state.values.groups_block?.groups_select?.selected_options ?? [];
-
-    // Preserve which "everyone" checkbox was active
-    const maydenChecked = (view.state.values.nag_everyone_block?.nag_everyone_select?.selected_options ?? []).length > 0;
-    const channelChecked = (view.state.values.nag_everyone_block?.nag_channel_select?.selected_options ?? []).length > 0;
-    const checkedBox: "mayden" | "channel" | null = maydenChecked ? "mayden" : channelChecked ? "channel" : null;
-
-    // Re-fetch group options so the rebuilt modal has the full picker list
-    const groupOptions = await fetchGroupOptions(client);
-
-    await client.views.update({
-      view_id: view.id,
-      view: {
-        type: "modal",
-        callback_id: "nag_modal",
-        title: { type: "plain_text", text: "🔔 Send a Nag", emoji: true },
-        submit: { type: "plain_text", text: "Send Nag", emoji: true },
-        close: { type: "plain_text", text: "Cancel" },
-        private_metadata: view.private_metadata,
-        blocks: buildModalBlocks(
-          selectedType,
-          groupOptions,
-          currentUserIds.length ? currentUserIds : undefined,
-          currentGroupSelections.length ? currentGroupSelections : undefined,
-          checkedBox,
-        ),
-      },
-    });
-  },
-).addViewSubmissionHandler("nag_modal", async ({ view, client }) => {
-  const values = view.state.values;
-  const meta = JSON.parse(view.private_metadata);
-  const { channel, nagged_by } = meta;
-
-  // Read people from multi_users_select; fall back to prefilled_user_ids if the user
-  // never touched the element after checking "Pre-fill everyone"
-  const pickedUserIds: string[] =
-    values.users_block?.users_select?.selected_users ?? [];
-  const userIds: string[] = pickedUserIds.length > 0
-    ? pickedUserIds
-    : (meta.prefilled_user_ids ?? []);
-
-  // Read usergroups from the separate groups picker and expand to member IDs
-  const selectedGroupOptions: SelectOption[] =
-    values.groups_block?.groups_select?.selected_options ?? [];
-  const groupIds: string[] = selectedGroupOptions.map((o: SelectOption) =>
-    o.value.startsWith("group_") ? o.value.slice(6) : o.value
-  );
-
-  // Expand usergroups to their members and deduplicate
-  for (const gid of groupIds) {
-    const ugUsersRes = await client.usergroups.users.list({ usergroup: gid });
-    const members: string[] = (ugUsersRes as { users?: string[] }).users ?? [];
-    for (const uid of members) {
-      if (!userIds.includes(uid)) userIds.push(uid);
-    }
-  }
-
-  const selectedUsers = userIds;
-
-  // rich_text_input returns a rich_text block; convert it to mrkdwn
-  // deno-lint-ignore no-explicit-any
-  const richValue = (values.message_block?.message_input as any)?.rich_text_value;
-  const message: string = richValue ? richTextToMrkdwn(richValue) : ((values.message_block?.message_input as any)?.value ?? "");
-
-  const nagType: string =
-    values.nag_type_block?.nag_type_select?.selected_option?.value ??
-    "standard";
-
-  const deadlineStr: string | undefined =
-    values.deadline_block?.deadline_input?.selected_date;
-
-  const daysBeforeStr: string | undefined =
-    values.days_before_block?.days_before_input?.value;
-
-  // Validate deadline is provided and is not in the past
-  if (nagType === "do_by_deadline") {
-    if (!deadlineStr) {
-      return {
-        response_action: "errors",
-        errors: {
-          deadline_block: "Please set a deadline for a 'Do By Deadline' nag.",
-        },
+      const view = body.view as {
+        id: string;
+        private_metadata: string;
+        state: {
+          values: Record<
+            string,
+            Record<
+              string,
+              {
+                selected_option?: { value: string };
+                selected_options?: SelectOption[];
+                selected_users?: string[];
+              }
+            >
+          >;
+        };
       };
-    }
+      const meta = JSON.parse(view.private_metadata);
+      const nagType =
+        view.state.values.nag_type_block?.nag_type_select?.selected_option
+          ?.value ?? "standard";
 
-    const deadlineDate = new Date(deadlineStr + "T00:00:00Z");
-    const todayUtc = new Date();
-    todayUtc.setUTCHours(0, 0, 0, 0);
-    if (deadlineDate < todayUtc) {
-      return {
-        response_action: "errors",
-        errors: {
-          deadline_block: "Deadline must be today or in the future.",
+      // Fetch usergroup options and preserve any already-selected group options
+      const groupOptions = await fetchGroupOptions(client);
+      const currentGroupSelections: SelectOption[] =
+        view.state.values.groups_block?.groups_select?.selected_options ?? [];
+
+      let initialUserIds: string[] | undefined;
+      if (checked) {
+        // Fetch all human (non-bot) members of the Mayden general channel
+        initialUserIds = await fetchHumanChannelMembers(
+          client,
+          GENERAL_CHANNEL_ID,
+        );
+      }
+
+      // Store prefilled user IDs in metadata so the submission handler can
+      // fall back to them if the user never interacts with the multi-select
+      // (initial_users alone isn't reflected in view.state.values at submit time)
+      const updatedMeta = JSON.stringify({
+        ...meta,
+        prefilled_user_ids: initialUserIds ?? [],
+        checked_box: checked ? "mayden" : null,
+      });
+
+      await client.views.update({
+        view_id: view.id,
+        view: {
+          type: "modal",
+          callback_id: "nag_modal",
+          title: { type: "plain_text", text: "🔔 Send a Nag", emoji: true },
+          submit: { type: "plain_text", text: "Send Nag", emoji: true },
+          close: { type: "plain_text", text: "Cancel" },
+          private_metadata: updatedMeta,
+          blocks: buildModalBlocks(
+            nagType,
+            groupOptions,
+            initialUserIds,
+            currentGroupSelections,
+            checked ? "mayden" : null,
+          ),
         },
+      });
+    },
+  )
+  .addBlockActionsHandler(
+    "nag_channel_select",
+    async ({ action, body, client }) => {
+      const checked = (
+        action as { selected_options: { value: string }[] }
+      ).selected_options.some((o) => o.value === "nag_channel");
+
+      const view = body.view as {
+        id: string;
+        private_metadata: string;
+        state: {
+          values: Record<
+            string,
+            Record<
+              string,
+              {
+                selected_option?: { value: string };
+                selected_options?: SelectOption[];
+                selected_users?: string[];
+              }
+            >
+          >;
+        };
       };
+      const meta = JSON.parse(view.private_metadata);
+      const nagType =
+        view.state.values.nag_type_block?.nag_type_select?.selected_option
+          ?.value ?? "standard";
+
+      const groupOptions = await fetchGroupOptions(client);
+      const currentGroupSelections: SelectOption[] =
+        view.state.values.groups_block?.groups_select?.selected_options ?? [];
+
+      let initialUserIds: string[] | undefined;
+      if (checked) {
+        // Fetch all members of the channel the command was called from
+        let allMembers: string[] = [];
+        let cursor: string | undefined;
+        do {
+          const membersResponse = await client.conversations.members({
+            channel: meta.channel,
+            limit: 200,
+            ...(cursor ? { cursor } : {}),
+          });
+          if (membersResponse.error) break;
+          allMembers = allMembers.concat(
+            (membersResponse.members as string[]) ?? [],
+          );
+          cursor = membersResponse.response_metadata?.next_cursor || undefined;
+        } while (cursor);
+
+        initialUserIds = allMembers;
+      }
+
+      const updatedMeta = JSON.stringify({
+        ...meta,
+        prefilled_user_ids: initialUserIds ?? [],
+        checked_box: checked ? "channel" : null,
+      });
+
+      await client.views.update({
+        view_id: view.id,
+        view: {
+          type: "modal",
+          callback_id: "nag_modal",
+          title: { type: "plain_text", text: "🔔 Send a Nag", emoji: true },
+          submit: { type: "plain_text", text: "Send Nag", emoji: true },
+          close: { type: "plain_text", text: "Cancel" },
+          private_metadata: updatedMeta,
+          blocks: buildModalBlocks(
+            nagType,
+            groupOptions,
+            initialUserIds,
+            currentGroupSelections,
+            checked ? "channel" : null,
+          ),
+        },
+      });
+    },
+  )
+  .addBlockActionsHandler(
+    "nag_type_select",
+    async ({ action, body, client }) => {
+      const selectedType = (action as { selected_option: { value: string } })
+        .selected_option.value;
+      const view = body.view as {
+        id: string;
+        private_metadata: string;
+        state: {
+          values: Record<
+            string,
+            Record<
+              string,
+              { selected_options?: SelectOption[]; selected_users?: string[] }
+            >
+          >;
+        };
+      };
+
+      const meta = JSON.parse(view.private_metadata);
+
+      // Preserve any users/groups already selected
+      const currentUserIds: string[] =
+        view.state.values.users_block?.users_select?.selected_users ?? [];
+      const currentGroupSelections: SelectOption[] =
+        view.state.values.groups_block?.groups_select?.selected_options ?? [];
+
+      // Preserve which "everyone" checkbox was active
+      const maydenChecked =
+        (
+          view.state.values.nag_everyone_block?.nag_everyone_select
+            ?.selected_options ?? []
+        ).length > 0;
+      const channelChecked =
+        (
+          view.state.values.nag_everyone_block?.nag_channel_select
+            ?.selected_options ?? []
+        ).length > 0;
+      const checkedBox: "mayden" | "channel" | null = maydenChecked
+        ? "mayden"
+        : channelChecked
+          ? "channel"
+          : null;
+
+      // Re-fetch group options so the rebuilt modal has the full picker list
+      const groupOptions = await fetchGroupOptions(client);
+
+      await client.views.update({
+        view_id: view.id,
+        view: {
+          type: "modal",
+          callback_id: "nag_modal",
+          title: { type: "plain_text", text: "🔔 Send a Nag", emoji: true },
+          submit: { type: "plain_text", text: "Send Nag", emoji: true },
+          close: { type: "plain_text", text: "Cancel" },
+          private_metadata: view.private_metadata,
+          blocks: buildModalBlocks(
+            selectedType,
+            groupOptions,
+            currentUserIds.length ? currentUserIds : undefined,
+            currentGroupSelections.length ? currentGroupSelections : undefined,
+            checkedBox,
+          ),
+        },
+      });
+    },
+  )
+  .addViewSubmissionHandler("nag_modal", async ({ view, client }) => {
+    const values = view.state.values;
+    const meta = JSON.parse(view.private_metadata);
+    const { channel, nagged_by } = meta;
+
+    // Read people from multi_users_select; fall back to prefilled_user_ids if the user
+    // never touched the element after checking "Pre-fill everyone"
+    const pickedUserIds: string[] =
+      values.users_block?.users_select?.selected_users ?? [];
+    const userIds: string[] =
+      pickedUserIds.length > 0
+        ? pickedUserIds
+        : (meta.prefilled_user_ids ?? []);
+
+    // Read usergroups from the separate groups picker and expand to member IDs
+    const selectedGroupOptions: SelectOption[] =
+      values.groups_block?.groups_select?.selected_options ?? [];
+    const groupIds: string[] = selectedGroupOptions.map((o: SelectOption) =>
+      o.value.startsWith("group_") ? o.value.slice(6) : o.value,
+    );
+
+    // Expand usergroups to their members and deduplicate
+    for (const gid of groupIds) {
+      const ugUsersRes = await client.usergroups.users.list({ usergroup: gid });
+      const members: string[] =
+        (ugUsersRes as { users?: string[] }).users ?? [];
+      for (const uid of members) {
+        if (!userIds.includes(uid)) userIds.push(uid);
+      }
     }
-  }
 
-  if (!selectedUsers.length || !message) {
-    return {
-      response_action: "errors",
-      errors: {
-        users_block:
-          "Please select at least one person.",
-      },
-    };
-  }
+    const selectedUsers = userIds;
 
-  // Ensure the bot is in the nag-bot channel
-  await client.conversations.join({ channel: NAG_BOT_CHANNEL_ID }).catch(
-    () => {},
-  );
+    // rich_text_input returns a rich_text block; convert it to mrkdwn
+    // deno-lint-ignore no-explicit-any
+    const richValue = (values.message_block?.message_input as any)
+      ?.rich_text_value;
+    const message: string = richValue
+      ? richTextToMrkdwn(richValue)
+      : ((values.message_block?.message_input as any)?.value ?? "");
 
-  // Invite any selected users who are not yet members of the nag-bot channel
-  let nagBotMembers: string[] = [];
-  let nbCursor: string | undefined;
-  do {
-    const mRes = await client.conversations.members({
-      channel: NAG_BOT_CHANNEL_ID,
-      limit: 200,
-      ...(nbCursor ? { cursor: nbCursor } : {}),
-    });
-    if (!mRes.error) {
-      nagBotMembers = nagBotMembers.concat(
-        (mRes.members as string[]) ?? [],
-      );
-    }
-    nbCursor = mRes.response_metadata?.next_cursor || undefined;
-  } while (nbCursor);
+    const nagType: string =
+      values.nag_type_block?.nag_type_select?.selected_option?.value ??
+      "standard";
 
-  const usersToInvite = selectedUsers.filter(
-    (uid: string) => !nagBotMembers.includes(uid),
-  );
-  if (usersToInvite.length > 0) {
-    await client.conversations.invite({
-      channel: NAG_BOT_CHANNEL_ID,
-      users: usersToInvite.join(","),
-    }).catch(() => {});
-  }
+    const deadlineStr: string | undefined =
+      values.deadline_block?.deadline_input?.selected_date;
 
-  // Build the nag message
-  const mentions = selectedUsers.map((uid: string) => `<@${uid}>`).join(" ");
-  const fullMessage = `${mentions}\n\n${message}\n\n_Please react to this message (e.g. ✅) once you're done!_`;
+    const daysBeforeStr: string | undefined =
+      values.days_before_block?.days_before_input?.value;
 
-  // Nag messages always go to the nag-bot channel
-  const postResponse = await client.chat.postMessage({
-    channel: NAG_BOT_CHANNEL_ID,
-    text: fullMessage,
-    blocks: [
-      {
-        type: "section",
-        text: { type: "mrkdwn", text: fullMessage },
-      },
-      {
-        type: "context",
-        elements: [
-          {
-            type: "mrkdwn",
-            text: `_Nag sent by <@${nagged_by}> • Use \`/nag-check\` to follow up_`,
+    // Validate deadline is provided and is not in the past
+    if (nagType === "do_by_deadline") {
+      if (!deadlineStr) {
+        return {
+          response_action: "errors",
+          errors: {
+            deadline_block: "Please set a deadline for a 'Do By Deadline' nag.",
           },
-        ],
-      },
-    ],
-  });
+        };
+      }
 
-  if (postResponse.error) {
-    return { response_action: "clear" };
-  }
+      const deadlineDate = new Date(deadlineStr + "T00:00:00Z");
+      const todayUtc = new Date();
+      todayUtc.setUTCHours(0, 0, 0, 0);
+      if (deadlineDate < todayUtc) {
+        return {
+          response_action: "errors",
+          errors: {
+            deadline_block: "Deadline must be today or in the future.",
+          },
+        };
+      }
+    }
 
-  // Bot reacts first so the ✅ reaction is primed for everyone else
-  await client.reactions.add({
-    channel: NAG_BOT_CHANNEL_ID,
-    timestamp: postResponse.ts as string,
-    name: "white_check_mark",
-  }).catch(() => {});
+    if (!selectedUsers.length || !message) {
+      return {
+        response_action: "errors",
+        errors: {
+          users_block: "Please select at least one person.",
+        },
+      };
+    }
 
-  const nagId = crypto.randomUUID();
-  const now = Math.floor(Date.now() / 1000);
+    // Ensure the bot is in the nag-bot channel
+    await client.conversations
+      .join({ channel: NAG_BOT_CHANNEL_ID })
+      .catch(() => {});
 
-  // Convert deadline date string ("YYYY-MM-DD") to a unix timestamp (midnight UTC)
-  const deadline = deadlineStr
-    ? Math.floor(new Date(deadlineStr + "T00:00:00Z").getTime() / 1000)
-    : undefined;
+    // Invite any selected users who are not yet members of the nag-bot channel
+    let nagBotMembers: string[] = [];
+    let nbCursor: string | undefined;
+    do {
+      const mRes = await client.conversations.members({
+        channel: NAG_BOT_CHANNEL_ID,
+        limit: 200,
+        ...(nbCursor ? { cursor: nbCursor } : {}),
+      });
+      if (!mRes.error) {
+        nagBotMembers = nagBotMembers.concat((mRes.members as string[]) ?? []);
+      }
+      nbCursor = mRes.response_metadata?.next_cursor || undefined;
+    } while (nbCursor);
 
-  const daysBeforeParsed = daysBeforeStr ? parseInt(daysBeforeStr, 10) : NaN;
-  const daysBefore =
-    !isNaN(daysBeforeParsed) && daysBeforeParsed > 0
-      ? daysBeforeParsed
+    const usersToInvite = selectedUsers.filter(
+      (uid: string) => !nagBotMembers.includes(uid),
+    );
+    if (usersToInvite.length > 0) {
+      await client.conversations
+        .invite({
+          channel: NAG_BOT_CHANNEL_ID,
+          users: usersToInvite.join(","),
+        })
+        .catch(() => {});
+    }
+
+    // Build the nag message
+    // When nagging everyone in Mayden, use <!channel> to bypass the ~100-mention
+    // notification limit; individual tracking still uses the full selectedUsers list.
+    const useMentionAll = meta.checked_box === "mayden";
+    const mentionText = useMentionAll
+      ? "<!channel>"
+      : selectedUsers.map((uid: string) => `<@${uid}>`).join(" ");
+    const fullMessage = `${mentionText}\n\n${message}\n\n_Please react to this message (e.g. ✅) once you're done!_`;
+
+    // Nag messages always go to the nag-bot channel
+    const postResponse = await client.chat.postMessage({
+      channel: NAG_BOT_CHANNEL_ID,
+      text: fullMessage,
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: fullMessage },
+        },
+        {
+          type: "context",
+          elements: [
+            {
+              type: "mrkdwn",
+              text: `_Nag sent by <@${nagged_by}> • Use \`/nag-check\` to follow up_`,
+            },
+          ],
+        },
+      ],
+    });
+
+    if (postResponse.error) {
+      return { response_action: "clear" };
+    }
+
+    // Bot reacts first so the ✅ reaction is primed for everyone else
+    await client.reactions
+      .add({
+        channel: NAG_BOT_CHANNEL_ID,
+        timestamp: postResponse.ts as string,
+        name: "white_check_mark",
+      })
+      .catch(() => {});
+
+    const nagId = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+
+    // Convert deadline date string ("YYYY-MM-DD") to a unix timestamp (midnight UTC)
+    const deadline = deadlineStr
+      ? Math.floor(new Date(deadlineStr + "T00:00:00Z").getTime() / 1000)
       : undefined;
 
-  // Save nag to datastore
-  await client.apps.datastore.put({
-    datastore: "nags",
-    item: {
-      id: nagId,
-      channel_id: NAG_BOT_CHANNEL_ID,
-      message_ts: postResponse.ts as string,
-      nagged_by,
-      nagged_users: JSON.stringify(selectedUsers),
-      message,
-      created_at: now,
-      nag_type: nagType,
-      ...(deadline !== undefined ? { deadline } : {}),
-      ...(daysBefore !== undefined ? { days_before: daysBefore } : {}),
-      is_cancelled: false,
-    },
-  });
+    const daysBeforeParsed = daysBeforeStr ? parseInt(daysBeforeStr, 10) : NaN;
+    const daysBefore =
+      !isNaN(daysBeforeParsed) && daysBeforeParsed > 0
+        ? daysBeforeParsed
+        : undefined;
 
-  // Increment nag counts for each nagged user
-  for (const uid of selectedUsers) {
-    const existing = await client.apps.datastore.get({
-      datastore: "nag_counts",
-      id: uid,
-    });
-
-    const currentCount: number = (existing.item?.total_nags as number) ?? 0;
-
+    // Save nag to datastore
     await client.apps.datastore.put({
-      datastore: "nag_counts",
+      datastore: "nags",
       item: {
-        user_id: uid,
-        total_nags: currentCount + 1,
-        last_nagged: now,
+        id: nagId,
+        channel_id: NAG_BOT_CHANNEL_ID,
+        message_ts: postResponse.ts as string,
+        nagged_by,
+        nagged_users: JSON.stringify(selectedUsers),
+        message,
+        created_at: now,
+        nag_type: nagType,
+        ...(deadline !== undefined ? { deadline } : {}),
+        ...(daysBefore !== undefined ? { days_before: daysBefore } : {}),
+        is_cancelled: false,
       },
     });
-  }
 
-  // Complete the function
-  await client.functions.completeSuccess({
-    function_execution_id: view.private_metadata,
-    outputs: {},
+    // Increment nag counts for each nagged user
+    for (const uid of selectedUsers) {
+      const existing = await client.apps.datastore.get({
+        datastore: "nag_counts",
+        id: uid,
+      });
+
+      const currentCount: number = (existing.item?.total_nags as number) ?? 0;
+
+      await client.apps.datastore.put({
+        datastore: "nag_counts",
+        item: {
+          user_id: uid,
+          total_nags: currentCount + 1,
+          last_nagged: now,
+        },
+      });
+    }
+
+    // Complete the function
+    await client.functions.completeSuccess({
+      function_execution_id: view.private_metadata,
+      outputs: {},
+    });
+
+    return { response_action: "clear" };
   });
-
-  return { response_action: "clear" };
-});
