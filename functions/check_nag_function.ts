@@ -36,7 +36,25 @@ function progressBar(pct: number, width = 10): string {
 export default SlackFunction(
   CheckNagFunctionDefinition,
   async ({ inputs, client }) => {
-    const { channel, checker } = inputs;
+    const { channel: _channel, checker, interactivity } = inputs;
+
+    // Open a loading modal immediately — interactivity_pointer expires in ~3 s
+    // and we have many API calls ahead; views.update uses view_id which never expires
+    const openRes = await client.views.open({
+      interactivity_pointer: interactivity.interactivity_pointer,
+      view: {
+        type: "modal",
+        title: { type: "plain_text", text: "Nag Reactions", emoji: true },
+        close: { type: "plain_text", text: "Close" },
+        blocks: [
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: "_Checking reaction status..._" },
+          },
+        ],
+      },
+    });
+    const viewId = (openRes.view as Record<string, string>)?.id;
 
     // Fetch recent nags from the nag-bot channel
     const queryRes = await client.apps.datastore.query({
@@ -48,16 +66,26 @@ export default SlackFunction(
     });
 
     if (!queryRes.ok || !queryRes.items?.length) {
-      await client.chat.postEphemeral({
-        channel,
-        user: checker,
-        text: "📭 No nags found in this channel yet. Use `/nag` to send one!",
-      });
-      await client.functions.completeSuccess({
-        function_execution_id: inputs.interactivity.interactivity_pointer,
-        outputs: {},
-      });
-      return { completed: false };
+      if (viewId) {
+        await client.views.update({
+          view_id: viewId,
+          view: {
+            type: "modal",
+            title: { type: "plain_text", text: "Nag Reactions", emoji: true },
+            close: { type: "plain_text", text: "Close" },
+            blocks: [
+              {
+                type: "section",
+                text: {
+                  type: "mrkdwn",
+                  text: "📭 No nags found yet. Use `/nag` to send one!",
+                },
+              },
+            ],
+          },
+        });
+      }
+      return { outputs: {} };
     }
 
     // Sort by most recent
@@ -65,206 +93,275 @@ export default SlackFunction(
       (a, b) => (b.created_at as number) - (a.created_at as number),
     );
 
-    const blocks: unknown[] = [
-      {
-        type: "header",
-        text: {
-          type: "plain_text",
-          text: "🔍 Recent Nags — Reaction Status",
-          emoji: true,
+    try {
+      const blocks: unknown[] = [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: "*🔍 Recent Nags — Reaction Status*",
+          },
         },
-      },
-      { type: "divider" },
-    ];
+        { type: "divider" },
+      ];
 
-    for (const nag of nags) {
-      const naggedUsers: string[] = JSON.parse(nag.nagged_users as string);
-      const msgTs = nag.message_ts as string;
+      for (const nag of nags) {
+        const naggedUsers: string[] = (() => {
+          try {
+            return JSON.parse(nag.nagged_users as string);
+          } catch {
+            return [];
+          }
+        })();
+        const msgTs = nag.message_ts as string;
 
-      // The bot must be in the nag-bot channel to call reactions.get
-      await client.conversations
-        .join({ channel: NAG_BOT_CHANNEL_ID })
-        .catch(() => {});
-
-      // Check reactions on the original message + any reminder messages
-      const reminderTs: string[] = JSON.parse(
-        (nag.reminder_timestamps as string) || "[]",
-      );
-      const timestampsToCheck = [msgTs, ...reminderTs];
-
-      let reactedUsers: string[] = [];
-      for (const ts of timestampsToCheck) {
-        try {
-          const reactRes = await client.reactions.get({
-            channel: NAG_BOT_CHANNEL_ID,
-            timestamp: ts,
-            full: true,
-          });
-          const reactions =
-            (reactRes.message as Record<string, unknown>)?.reactions ?? [];
-          const users = (reactions as Record<string, unknown>[]).flatMap(
-            (r) => r.users as string[],
-          );
-          reactedUsers = [...new Set([...reactedUsers, ...users])];
-        } catch (_) {
-          // Message may have been deleted
-        }
-      }
-
-      const done = naggedUsers.filter((uid) => reactedUsers.includes(uid));
-      const pending = naggedUsers.filter((uid) => !reactedUsers.includes(uid));
-      const pct = naggedUsers.length
-        ? Math.round((done.length / naggedUsers.length) * 100)
-        : 0;
-
-      const dateStr = new Date(
-        (nag.created_at as number) * 1000,
-      ).toLocaleDateString("en-GB", {
-        day: "numeric",
-        month: "short",
-        hour: "2-digit",
-        minute: "2-digit",
-      });
-
-      // Build permalink
-      let link = "";
-      try {
-        const pl = await client.chat.getPermalink({
-          channel: NAG_BOT_CHANNEL_ID,
-          message_ts: msgTs,
-        });
-        link = pl.permalink as string;
-      } catch (_) {}
-
-      // If everyone has reacted, clean up and notify the nagger via DM
-      if (pending.length === 0 && naggedUsers.length > 0) {
-        await client.apps.datastore
-          .delete({
-            datastore: "nags",
-            id: nag.id as string,
-          })
+        // The bot must be in the nag-bot channel to call reactions.get
+        await client.conversations
+          .join({ channel: NAG_BOT_CHANNEL_ID })
           .catch(() => {});
 
-        try {
-          const dmRes = await client.conversations.open({
-            users: nag.nagged_by as string,
-          });
-          if (dmRes.ok && dmRes.channel?.id) {
-            const nagLink = link ? `<${link}|your nag>` : "your nag";
-            await client.chat.postMessage({
-              channel: dmRes.channel.id as string,
-              text: `✅ Everyone has completed ${nagLink}!\n\n> ${(nag.message as string).slice(0, 100)}${
-                (nag.message as string).length > 100 ? "…" : ""
-              }`,
+        // Check reactions on the original message + any reminder messages
+        const reminderTs: string[] = JSON.parse(
+          (nag.reminder_timestamps as string) || "[]",
+        );
+        const timestampsToCheck = [msgTs, ...reminderTs];
+
+        let reactedUsers: string[] = [];
+        for (const ts of timestampsToCheck) {
+          try {
+            const reactRes = await client.reactions.get({
+              channel: NAG_BOT_CHANNEL_ID,
+              timestamp: ts,
+              full: true,
             });
+            const reactions =
+              (reactRes.message as Record<string, unknown>)?.reactions ?? [];
+            const users = (reactions as Record<string, unknown>[]).flatMap(
+              (r) => r.users as string[],
+            );
+            reactedUsers = [...new Set([...reactedUsers, ...users])];
+          } catch (_) {
+            // Message may have been deleted
           }
+        }
+
+        const done = naggedUsers.filter((uid) => reactedUsers.includes(uid));
+        const pending = naggedUsers.filter(
+          (uid) => !reactedUsers.includes(uid),
+        );
+        const pct = naggedUsers.length
+          ? Math.round((done.length / naggedUsers.length) * 100)
+          : 0;
+
+        const dateStr = new Date(
+          (nag.created_at as number) * 1000,
+        ).toLocaleDateString("en-GB", {
+          day: "numeric",
+          month: "short",
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+
+        // Build permalink
+        let link = "";
+        try {
+          const pl = await client.chat.getPermalink({
+            channel: NAG_BOT_CHANNEL_ID,
+            message_ts: msgTs,
+          });
+          link = pl.permalink as string;
         } catch (_) {}
 
-        continue; // Don't show completed nags in the check output
-      }
+        // If everyone has reacted, clean up and notify the nagger via DM
+        if (pending.length === 0 && naggedUsers.length > 0) {
+          await client.apps.datastore
+            .delete({
+              datastore: "nags",
+              id: nag.id as string,
+            })
+            .catch(() => {});
 
-      const nagType = (nag.nag_type as string) ?? "standard";
-      const isRecurring = nagType === "do_now" || nagType === "do_by_deadline";
-      const isCancelled = nag.is_cancelled as boolean | undefined;
+          try {
+            const dmRes = await client.conversations.open({
+              users: nag.nagged_by as string,
+            });
+            if (dmRes.ok && dmRes.channel?.id) {
+              const nagLink = link ? `<${link}|your nag>` : "your nag";
+              await client.chat.postMessage({
+                channel: dmRes.channel.id as string,
+                text: `✅ Everyone has completed ${nagLink}!\n\n> ${(nag.message as string).slice(0, 100)}${
+                  (nag.message as string).length > 100 ? "…" : ""
+                }`,
+              });
+            }
+          } catch (_) {}
 
-      let typeLabel = "";
-      if (nagType === "do_now") {
-        typeLabel = isCancelled ? " _(🔁 Do Now — cancelled)_" : " _🔁 Do Now_";
-      } else if (nagType === "do_by_deadline") {
-        const deadlineStr = nag.deadline
-          ? new Date((nag.deadline as number) * 1000).toLocaleDateString(
-              "en-GB",
-              { day: "numeric", month: "short", year: "numeric" },
-            )
-          : "no date set";
-        typeLabel = isCancelled
-          ? ` _(⏰ Deadline: ${deadlineStr} — cancelled)_`
-          : ` _⏰ Due ${deadlineStr}_`;
-      }
+          continue; // Don't show completed nags in the check output
+        }
 
-      const nagText = [
-        `*${link ? `<${link}|Nag>` : "Nag"}* from <@${nag.nagged_by}> • _${dateStr}_${typeLabel}`,
-        `> ${(nag.message as string).slice(0, 100)}${
-          (nag.message as string).length > 100 ? "…" : ""
-        }`,
-        `${progressBar(pct)}  *${done.length}/${naggedUsers.length}* reacted`,
-        pending.length
-          ? `⏳ Still waiting on: ${pending.map((u) => `<@${u}>`).join(", ")}`
-          : "✅ _Everyone has reacted!_",
-      ].join("\n");
+        const nagType = (nag.nag_type as string) ?? "standard";
+        const isRecurring =
+          nagType === "do_now" || nagType === "do_by_deadline";
+        const isCancelled = nag.is_cancelled as boolean | undefined;
 
-      const block: Record<string, unknown> = {
-        type: "section",
-        text: { type: "mrkdwn", text: nagText },
-      };
+        let typeLabel = "";
+        if (nagType === "do_now") {
+          typeLabel = isCancelled
+            ? " _(🔁 Do Now — cancelled)_"
+            : " _🔁 Do Now_";
+        } else if (nagType === "do_by_deadline") {
+          const deadlineStr = nag.deadline
+            ? new Date((nag.deadline as number) * 1000).toLocaleDateString(
+                "en-GB",
+                { day: "numeric", month: "short", year: "numeric" },
+              )
+            : "no date set";
+          typeLabel = isCancelled
+            ? ` _(⏰ Deadline: ${deadlineStr} — cancelled)_`
+            : ` _⏰ Due ${deadlineStr}_`;
+        }
 
-      if (pending.length) {
-        block.accessory = {
-          type: "button",
-          text: { type: "plain_text", text: "🔔 Re-nag them", emoji: true },
-          style: "danger",
-          action_id: `renag_${nag.id}`,
-          value: JSON.stringify({
-            nagId: nag.id,
-            channel: NAG_BOT_CHANNEL_ID,
-            pendingUsers: pending,
-            originalMessage: nag.message,
-            messageTs: msgTs,
-          }),
-          confirm: {
-            title: { type: "plain_text", text: "Send follow-up nag?" },
-            text: {
-              type: "mrkdwn",
-              text: `This will ping ${pending.map((u: string) => `<@${u}>`).join(", ")} in the channel.`,
-            },
-            confirm: { type: "plain_text", text: "Yes, nag them!" },
-            deny: { type: "plain_text", text: "Cancel" },
-          },
+        const nagText = [
+          `*${link ? `<${link}|Nag>` : "Nag"}* from <@${nag.nagged_by}> • _${dateStr}_${typeLabel}`,
+          `> ${(nag.message as string).slice(0, 100)}${
+            (nag.message as string).length > 100 ? "…" : ""
+          }`,
+          `${progressBar(pct)}  *${done.length}/${naggedUsers.length}* reacted`,
+          pending.length
+            ? `⏳ Still waiting on: ${pending.map((u) => `<@${u}>`).join(", ")}`
+            : "✅ _Everyone has reacted!_",
+        ].join("\n");
+
+        const block: Record<string, unknown> = {
+          type: "section",
+          text: { type: "mrkdwn", text: nagText },
         };
-      }
 
-      blocks.push(block);
-
-      // Add cancel button for active recurring nags
-      if (isRecurring && !isCancelled) {
-        blocks.push({
-          type: "actions",
-          elements: [
-            {
-              type: "button",
+        if (pending.length) {
+          block.accessory = {
+            type: "button",
+            text: { type: "plain_text", text: "🔔 Re-nag them", emoji: true },
+            style: "danger",
+            action_id: `renag_${nag.id}`,
+            value: JSON.stringify({
+              nagId: nag.id,
+              channel: NAG_BOT_CHANNEL_ID,
+              pendingUsers: pending,
+              originalMessage: (nag.message as string).slice(0, 100),
+              messageTs: msgTs,
+            }),
+            confirm: {
+              title: { type: "plain_text", text: "Send follow-up nag?" },
               text: {
                 type: "plain_text",
-                text: "🚫 Cancel Recurring",
-                emoji: true,
+                text: `This will ping ${pending.length} person${pending.length !== 1 ? "s" : ""} in the channel.`,
               },
-              action_id: `cancel_recurring_${nag.id}`,
-              value: nag.id as string,
-              confirm: {
-                title: {
-                  type: "plain_text",
-                  text: "Cancel recurring nag?",
-                },
-                text: {
-                  type: "mrkdwn",
-                  text: "This stops all future automatic daily re-nags for this nag.",
-                },
-                confirm: { type: "plain_text", text: "Yes, cancel it" },
-                deny: { type: "plain_text", text: "Keep going" },
-              },
+              confirm: { type: "plain_text", text: "Yes, nag them!" },
+              deny: { type: "plain_text", text: "Cancel" },
             },
-          ],
+          };
+        }
+
+        blocks.push(block);
+
+        // Add cancel button for active recurring nags
+        if (isRecurring && !isCancelled) {
+          blocks.push({
+            type: "actions",
+            elements: [
+              {
+                type: "button",
+                text: {
+                  type: "plain_text",
+                  text: "🚫 Cancel Recurring",
+                  emoji: true,
+                },
+                action_id: `cancel_recurring_${nag.id}`,
+                value: nag.id as string,
+                confirm: {
+                  title: {
+                    type: "plain_text",
+                    text: "Cancel recurring nag?",
+                  },
+                  text: {
+                    type: "mrkdwn",
+                    text: "This stops all future automatic daily re-nags for this nag.",
+                  },
+                  confirm: { type: "plain_text", text: "Yes, cancel it" },
+                  deny: { type: "plain_text", text: "Keep going" },
+                },
+              },
+            ],
+          });
+        }
+
+        blocks.push({ type: "divider" });
+      }
+
+      // If all nags were completed (all continued), show a friendly message
+      if (blocks.length === 2) {
+        blocks.push({
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: "✅ All nags are complete — nothing pending!",
+          },
         });
       }
 
-      blocks.push({ type: "divider" });
+      const updateRes = await client.views.update({
+        view_id: viewId,
+        view: {
+          type: "modal",
+          title: { type: "plain_text", text: "Nag Reactions", emoji: true },
+          close: { type: "plain_text", text: "Close" },
+          blocks: blocks as Record<string, unknown>[],
+        },
+      });
+      if (!updateRes.ok && viewId) {
+        await client.views
+          .update({
+            view_id: viewId,
+            view: {
+              type: "modal",
+              title: { type: "plain_text", text: "Nag Reactions", emoji: true },
+              close: { type: "plain_text", text: "Close" },
+              blocks: [
+                {
+                  type: "section",
+                  text: {
+                    type: "mrkdwn",
+                    text: `⚠️ Failed to render nags: ${updateRes.error}`,
+                  },
+                },
+              ],
+            },
+          })
+          .catch(() => {});
+      }
+    } catch (err) {
+      if (viewId) {
+        await client.views
+          .update({
+            view_id: viewId,
+            view: {
+              type: "modal",
+              title: { type: "plain_text", text: "Nag Reactions", emoji: true },
+              close: { type: "plain_text", text: "Close" },
+              blocks: [
+                {
+                  type: "section",
+                  text: {
+                    type: "mrkdwn",
+                    text: `⚠️ Something went wrong loading nag status: ${err}`,
+                  },
+                },
+              ],
+            },
+          })
+          .catch(() => {});
+      }
     }
-
-    await client.chat.postEphemeral({
-      channel,
-      user: checker,
-      blocks,
-      text: "Here are your recent nags and their reaction status:",
-    });
 
     return { completed: false };
   },
@@ -347,14 +444,35 @@ export default SlackFunction(
       });
     }
 
-    // Confirm to the checker ephemerally in the channel where they invoked
-    const invocationChannel =
-      (body.container as Record<string, string>)?.channel_id || channelId;
-    await client.chat.postEphemeral({
-      channel: invocationChannel,
-      user: checker,
-      text: `✅ Re-nag sent to ${(pendingUsers as string[]).map((u) => `<@${u}>`).join(", ")}!`,
-    });
+    // Confirm — update the modal if called from one, otherwise ephemeral fallback
+    const viewId = (body.view as Record<string, string>)?.id;
+    if (viewId) {
+      await client.views.update({
+        view_id: viewId,
+        view: {
+          type: "modal",
+          title: { type: "plain_text", text: "Re-nagged!", emoji: true },
+          close: { type: "plain_text", text: "Close" },
+          blocks: [
+            {
+              type: "section",
+              text: {
+                type: "mrkdwn",
+                text: `✅ Re-nag sent to ${(pendingUsers as string[]).map((u: string) => `<@${u}>`).join(", ")}!`,
+              },
+            },
+          ],
+        },
+      });
+    } else {
+      const invocationChannel =
+        (body.container as Record<string, string>)?.channel_id || channelId;
+      await client.chat.postEphemeral({
+        channel: invocationChannel,
+        user: checker,
+        text: `✅ Re-nag sent to ${(pendingUsers as string[]).map((u: string) => `<@${u}>`).join(", ")}!`,
+      });
+    }
   })
   .addBlockActionsHandler(
     /^cancel_recurring_/,
@@ -380,12 +498,33 @@ export default SlackFunction(
         item: { ...res.item, is_cancelled: true },
       });
 
-      const invocationChannel =
-        (body.container as Record<string, string>)?.channel_id || channelId;
-      await client.chat.postEphemeral({
-        channel: invocationChannel,
-        user: canceller,
-        text: "🚫 Recurring nag cancelled — no more automatic daily reminders for that nag.",
-      });
+      const viewId = (body.view as Record<string, string>)?.id;
+      if (viewId) {
+        await client.views.update({
+          view_id: viewId,
+          view: {
+            type: "modal",
+            title: { type: "plain_text", text: "Cancelled", emoji: true },
+            close: { type: "plain_text", text: "Close" },
+            blocks: [
+              {
+                type: "section",
+                text: {
+                  type: "mrkdwn",
+                  text: "🚫 Recurring nag cancelled — no more automatic daily reminders for that nag.",
+                },
+              },
+            ],
+          },
+        });
+      } else {
+        const invocationChannel =
+          (body.container as Record<string, string>)?.channel_id || channelId;
+        await client.chat.postEphemeral({
+          channel: invocationChannel,
+          user: canceller,
+          text: "🚫 Recurring nag cancelled — no more automatic daily reminders for that nag.",
+        });
+      }
     },
   );
