@@ -143,6 +143,16 @@ export default SlackFunction(
           timestamp: reminderRes.ts as string,
           name: "white_check_mark",
         }).catch(() => {});
+
+        // Store the reminder timestamp so reactions to it count for points
+        const reminders: string[] = JSON.parse(
+          (nag.reminder_timestamps as string) || "[]",
+        );
+        reminders.push(reminderRes.ts);
+        await client.apps.datastore.put({
+          datastore: "nags",
+          item: { ...nag, reminder_timestamps: JSON.stringify(reminders) },
+        });
       }
 
       // Increment nag counts for pending users
